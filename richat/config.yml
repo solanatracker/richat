@@ -63,7 +63,8 @@ channel:
       # Root directory for replay storage. Metadata RocksDB is stored at
       # <path>/metadata and segment files at <path>/segments.
       # path: ./db
-      # max_slots: 1024 # retention target in slots; trim is approximate to whole segments
+      # max_slots: 1024 # replay window in slot numbers; set 3000 for a 3000-slot window
+      # commitments: [processed] # disk replay levels; use [processed, confirmed, finalized] for all three
       # serialize_affinity: null # CPU affinity for the collector thread
       # write_affinity: null # CPU affinity for the ordered segment appender / metadata writer
       # segment_target_size: 4GiB # rotate to a new .seg file when the active one reaches this size

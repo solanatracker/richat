@@ -1,4 +1,5 @@
 pub mod metadata;
+mod reader;
 pub mod segments;
 
 use {
@@ -9,7 +10,8 @@ use {
         metrics::GrpcSubscribeMessage,
         storage::{
             metadata::Metadata,
-            segments::{SegmentReader, WriterCommand},
+            reader::{ReplaySelection, ScannedRecord},
+            segments::{COMMITMENT_RECORDS, DecompressedChunk, SegmentReader, WriterCommand},
         },
         util::SpawnedThreads,
     },
@@ -17,7 +19,7 @@ use {
     anyhow::Context,
     futures::future::try_join_all,
     quanta::Instant,
-    richat_filter::message::{MessageParserEncoding, MessageRef},
+    richat_filter::message::MessageParserEncoding,
     richat_metrics::duration_to_seconds,
     richat_shared::mutex_lock,
     smallvec::SmallVec,
@@ -48,6 +50,7 @@ pub struct SlotIndexValue {
 #[derive(Debug, Clone)]
 pub struct Storage {
     metadata: Metadata,
+    commitment_mask: u8,
     write_tx: kanal::Sender<WriterCommand>,
     replay_queue: Arc<Mutex<ReplayQueue>>,
     metric_disk_size_poll_interval: Duration,
@@ -59,6 +62,21 @@ impl Storage {
         parser: MessageParserEncoding,
         shutdown: CancellationToken,
     ) -> anyhow::Result<(Self, SpawnedThreads)> {
+        anyhow::ensure!(config.max_slots > 0, "storage.max_slots must be positive");
+        anyhow::ensure!(
+            !config.commitments.is_empty(),
+            "storage.commitments must not be empty"
+        );
+        anyhow::ensure!(
+            config.replay_threads > 0 && config.compressor_threads > 0,
+            "storage worker counts must be positive"
+        );
+        anyhow::ensure!(
+            config.replay_decode_per_tick > 0
+                && config.chunk_target_size > 0
+                && config.segment_target_size > 0,
+            "storage decode and chunk/segment sizes must be positive"
+        );
         let segments_path = config.segments_path();
         std::fs::create_dir_all(&segments_path)
             .with_context(|| format!("failed to create segments path: {segments_path:?}"))?;
@@ -67,6 +85,7 @@ impl Storage {
         let (write_tx, mut threads) = segments::spawn_write_pipeline(&config, metadata.clone())?;
 
         let storage = Self {
+            commitment_mask: config.commitment_mask(),
             metadata,
             write_tx,
             replay_queue: Arc::new(Mutex::new(ReplayQueue::new(config.replay_inflight_max))),
@@ -120,122 +139,125 @@ impl Storage {
                 }
             }
 
-            let mut locked_state = req.client.state_lock();
-            if locked_state.finished {
+            let mut state = req.client.state_lock();
+            if state.finished
+                || state.replay_generation != req.generation
+                || !matches!(state.head, IndexLocation::Storage(_))
+            {
+                drop(state);
                 ReplayQueue::drop_req(&storage.replay_queue);
                 continue;
             }
-
             if let Some(error) = req.state.read_error.take() {
-                drop(locked_state);
+                state.finished = true;
                 req.client.push_error(error);
+                drop(state);
                 ReplayQueue::drop_req(&storage.replay_queue);
                 continue;
             }
-
-            let IndexLocation::Storage(head) = locked_state.head else {
-                ReplayQueue::drop_req(&storage.replay_queue);
-                continue;
+            let IndexLocation::Storage(mut next_index) = state.head else {
+                unreachable!()
             };
-
-            let mut current_head = *req.state.head.get_or_insert(head);
-            if current_head != head {
-                req.state.messages.clear();
-            }
-
-            let ts = Instant::now();
             let mut pushed = false;
-            let mut messages_len = req.client.messages_len.load(Ordering::Relaxed);
-            while messages_len <= req.client.messages_replay_len_max {
-                let Some((index, message)) = req.state.messages.pop_front() else {
+            while req.client.messages_len.load(Ordering::Relaxed)
+                < req.client.messages_replay_len_max
+            {
+                let Some(record) = req.state.messages.pop_front() else {
                     break;
                 };
-
-                let filter = locked_state.filter.as_ref().expect("defined filter");
-                let message_ref: MessageRef = (&message).into();
+                if record.index != next_index {
+                    req.state.read_error = Some(Status::data_loss("gap in disk replay journal"));
+                    break;
+                }
+                next_index = record.index + 1;
+                let Some(message) = record.message else {
+                    continue;
+                };
+                let filter = state.filter.as_ref().expect("defined filter");
                 let items = filter
-                    .get_updates_ref(message_ref, CommitmentLevel::Processed)
+                    .get_updates_ref((&message).into(), state.commitment)
                     .iter()
                     .map(|msg| ((&msg.filtered_update).into(), msg.encode_to_vec()))
                     .collect::<SmallVec<[(GrpcSubscribeMessage, Vec<u8>); 2]>>();
-
                 for (message, data) in items {
-                    messages_len += data.len();
                     req.client.push_message(message, data);
                     pushed = true;
                 }
-
-                current_head = index;
             }
-
-            locked_state.head = IndexLocation::Storage(current_head);
-            req.state.head = Some(current_head);
+            state.head = IndexLocation::Storage(next_index);
             if pushed {
-                locked_state.observe_time_to_first_message();
+                state.observe_time_to_first_message();
+                req.client.wake();
             }
-
-            if req.state.read_finished && req.state.messages.is_empty() {
-                if let Some(head) = req.messages.get_head_by_replay_index(current_head + 1) {
-                    locked_state.head = IndexLocation::Memory(head);
-                } else {
-                    req.state.read_error = Some(Status::internal(
-                        "failed to connect replay index to memory channel",
-                    ));
-                }
-
+            if req.state.read_error.is_none()
+                && let Some(head) = req.messages.get_head_by_replay_index(next_index)
+            {
+                state.head = IndexLocation::Memory(head);
+                drop(state);
                 req.metric_cpu_usage
                     .increment(duration_to_seconds(ts.elapsed()));
-                drop(locked_state);
-                if pushed {
-                    req.client.wake();
-                }
                 ReplayQueue::drop_req(&storage.replay_queue);
                 continue;
             }
+            let read_more = req.state.messages.is_empty()
+                && req.client.messages_len.load(Ordering::Relaxed)
+                    < req.client.messages_replay_len_max;
+            let selection = ReplaySelection {
+                commitment: state.commitment,
+                from_slot: state.replay_from_slot,
+            };
+            drop(state);
 
-            drop(locked_state);
-            if pushed {
-                req.client.wake();
-            }
-
-            if !req.state.read_finished && req.state.messages.len() < messages_decode_per_tick {
-                let mut messages_decoded = 0;
-                'outer: for chunk_result in
-                    storage.read_messages_from_index(current_head + 1, parser)
-                {
-                    match chunk_result {
-                        Ok(mut chunk) => {
-                            for result in &mut chunk {
-                                match result {
-                                    Ok(record) => {
-                                        messages_decoded += 1;
-                                        req.state.messages.push_back(record);
-                                    }
-                                    Err(error) => {
-                                        req.state.read_error =
-                                            Some(Status::internal(error.to_string()));
-                                        break 'outer;
-                                    }
+            // Keep the reader and the partially decoded chunk between turns. The
+            // configured budget is a record budget, including nonmatching commitments.
+            if read_more && req.state.read_error.is_none() {
+                let reader = req
+                    .state
+                    .reader
+                    .get_or_insert_with(|| storage.read_messages_from_index(next_index, parser));
+                let mut decoded_bytes = 0usize;
+                for _ in 0..messages_decode_per_tick {
+                    loop {
+                        if let Some(chunk) = req.state.chunk.as_mut()
+                            && let Some(record) = chunk.next_selected(Some(selection))
+                        {
+                            match record {
+                                Ok(record) => {
+                                    decoded_bytes = decoded_bytes.saturating_add(
+                                        record.message.as_ref().map_or(0, ParsedMessage::size),
+                                    );
+                                    req.state.messages.push_back(record);
+                                }
+                                Err(error) => {
+                                    req.state.read_error =
+                                        Some(Status::data_loss(error.to_string()))
                                 }
                             }
-                        }
-                        Err(error) => {
-                            req.state.read_error = Some(Status::internal(error.to_string()));
                             break;
                         }
+                        match reader.next() {
+                            Some(Ok(chunk)) => req.state.chunk = Some(chunk),
+                            Some(Err(error)) => {
+                                req.state.read_error = Some(Status::data_loss(error.to_string()));
+                                break;
+                            }
+                            None => break, // writer may still be flushing: retry next turn
+                        }
                     }
-                    if messages_decoded >= messages_decode_per_tick {
+                    if req.state.read_error.is_some()
+                        || req.state.messages.is_empty()
+                        || decoded_bytes >= req.client.messages_replay_len_max
+                    {
                         break;
                     }
                 }
-
-                if messages_decoded < messages_decode_per_tick && req.state.read_error.is_none() {
-                    req.state.read_finished = true;
-                }
             }
-
             req.metric_cpu_usage
                 .increment(duration_to_seconds(ts.elapsed()));
+            if req.state.messages.is_empty() || !read_more {
+                // Defer only this request. Other runnable clients keep the worker.
+                req.retry_at = Some(Instant::now() + Duration::from_millis(1));
+            }
             prev_request = Some(req);
         }
         ReplayQueue::shutdown(&storage.replay_queue);
@@ -249,8 +271,10 @@ impl Storage {
         head: u64,
         index: u64,
         message: ParsedMessage,
+        commitment: CommitmentLevel,
     ) {
         let _ = self.write_tx.send(WriterCommand::PushMessage {
+            commitment,
             init,
             slot,
             head,
@@ -259,10 +283,60 @@ impl Storage {
         });
     }
 
+    pub fn restore_payload(&self, index: u64, message: ParsedMessage) {
+        let _ = self
+            .write_tx
+            .send(WriterCommand::RestorePayload { index, message });
+    }
+
     pub fn trim_messages(&self, slot: Slot, until: Option<u64>) {
         let _ = self
             .write_tx
             .send(WriterCommand::RemoveReplay { slot, until });
+    }
+
+    pub fn next_index(&self) -> u64 {
+        self.metadata
+            .catalog()
+            .chunks
+            .last()
+            .map_or(0, |chunk| chunk.last_index + 1)
+    }
+
+    pub const fn commitment_bit(commitment: CommitmentLevel) -> u8 {
+        match commitment {
+            CommitmentLevel::Processed => 1,
+            CommitmentLevel::Confirmed => 2,
+            CommitmentLevel::Finalized => 4,
+        }
+    }
+
+    pub const fn replay_enabled(&self, commitment: CommitmentLevel) -> bool {
+        self.commitment_mask & Self::commitment_bit(commitment) != 0
+    }
+
+    pub fn supports_commitment_replay(&self, index: u64, commitment: CommitmentLevel) -> bool {
+        self.metadata
+            .catalog()
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.last_index >= index)
+            .all(|chunk| {
+                if chunk.compression & COMMITMENT_RECORDS == 0 {
+                    commitment == CommitmentLevel::Processed
+                } else {
+                    (chunk.compression >> 2) & Self::commitment_bit(commitment) != 0
+                }
+            })
+    }
+
+    pub fn supports_block_replay(&self, index: u64) -> bool {
+        self.metadata
+            .catalog()
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.last_index >= index)
+            .all(|chunk| chunk.compression & COMMITMENT_RECORDS != 0)
     }
 
     pub fn read_slots(&self) -> BTreeMap<Slot, SlotIndexValue> {
@@ -295,10 +369,13 @@ impl Storage {
         client: SubscribeClient,
         messages: Arc<SharedChannel>,
         metric_cpu_usage: Gauge,
+        generation: u64,
     ) -> Result<(), &'static str> {
         ReplayQueue::push_new(
             &self.replay_queue,
             ReplayRequest {
+                retry_at: None,
+                generation,
                 state: ReplayState::default(),
                 client,
                 messages,
@@ -375,6 +452,8 @@ async fn dir_size(path: PathBuf) -> std::io::Result<u64> {
 
 #[derive(Debug)]
 struct ReplayRequest {
+    retry_at: Option<Instant>,
+    generation: u64,
     state: ReplayState,
     client: SubscribeClient,
     messages: Arc<SharedChannel>,
@@ -383,10 +462,10 @@ struct ReplayRequest {
 
 #[derive(Debug, Default)]
 struct ReplayState {
-    head: Option<u64>,
-    messages: VecDeque<(u64, ParsedMessage)>,
+    reader: Option<SegmentReader>,
+    chunk: Option<DecompressedChunk>,
+    messages: VecDeque<ScannedRecord>,
     read_error: Option<Status>,
-    read_finished: bool,
 }
 
 #[derive(Debug)]
@@ -412,7 +491,16 @@ impl ReplayQueue {
         {
             locked.requests.push_back(request);
         }
-        locked.requests.pop_front()
+        let now = Instant::now();
+        for _ in 0..locked.requests.len() {
+            let mut request = locked.requests.pop_front().unwrap();
+            if request.retry_at.is_none_or(|retry_at| retry_at <= now) {
+                request.retry_at = None;
+                return Some(request);
+            }
+            locked.requests.push_back(request);
+        }
+        None
     }
 
     fn push_new(queue: &Mutex<Self>, request: ReplayRequest) -> Result<(), ()> {
@@ -428,7 +516,7 @@ impl ReplayQueue {
 
     fn drop_req(queue: &Mutex<Self>) {
         let mut locked = mutex_lock(queue);
-        locked.len -= 1;
+        locked.len = locked.len.saturating_sub(1);
     }
 
     fn shutdown(queue: &Mutex<Self>) {
@@ -436,5 +524,36 @@ impl ReplayQueue {
         locked.capacity = 0;
         locked.len = 0;
         locked.requests.clear();
+    }
+}
+
+#[cfg(test)]
+mod replay_queue_tests {
+    use super::*;
+
+    fn request(generation: u64, retry_at: Option<Instant>) -> ReplayRequest {
+        ReplayRequest {
+            retry_at,
+            generation,
+            state: ReplayState::default(),
+            client: SubscribeClient::new(generation, 256, 256, Arc::from("queue-test")),
+            messages: Arc::new(SharedChannel::new(8, false)),
+            metric_cpu_usage: Gauge::noop(),
+        }
+    }
+
+    #[test]
+    fn deferred_clients_never_prevent_a_ready_client_from_running() {
+        let queue = Mutex::new(ReplayQueue::new(4));
+        let later = Some(Instant::now() + Duration::from_secs(60));
+        for (generation, retry) in [(1, later), (2, None), (3, later), (4, None)] {
+            assert!(ReplayQueue::push_new(&queue, request(generation, retry)).is_ok());
+        }
+        let first = ReplayQueue::pop_next(&queue, None).unwrap();
+        assert_eq!(first.generation, 2);
+        let second = ReplayQueue::pop_next(&queue, Some(first)).unwrap();
+        assert_eq!(second.generation, 4);
+        let third = ReplayQueue::pop_next(&queue, Some(second)).unwrap();
+        assert_eq!(third.generation, 2);
     }
 }

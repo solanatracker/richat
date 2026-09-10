@@ -12,9 +12,19 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Fixes
 
+- richat: fix inclusive disk replay cursors, bounded decoding, and handoff to the matching live commitment; cancel stale replay workers on subscription changes.
+- richat: preserve journal indices and payload references across restart, handle skipped slots, and stop advertising partially evicted memory slots.
+- richat: keep the highest account write version in committed streams and reconstructed blocks when updates arrive out of order.
+
 ### Features
 
+- richat: store shared replay payloads once with commitment publication references; skip excluded commitments before protobuf decoding and defer backpressured clients without stalling ready replays.
+- richat: verify `from_slot` with the official Yellowstone protobuf client over HTTP/2, including blocks, accounts, transactions, and repeated requests; remove the blanket `blocks are not possible to replay` rejection.
+- richat: support `from_slot` at every commitment, including complete blocks; configure disk history with `storage.commitments` (default `[processed]`) and `max_slots` (unchanged default 1024, tested with 3000).
+
 ### Breaking
+
+- richat: new disk chunks record commitment streams and blocks. Old processed-only chunks remain readable, but new chunks cannot be read by older binaries.
 
 ## 2026-09-10
 

@@ -4,8 +4,7 @@ use {
         config::ConfigStorage,
         metrics::{
             CHANNEL_STORAGE_WRITE_COLLECTOR_INDEX, CHANNEL_STORAGE_WRITE_COMPRESSOR_INDEX,
-            CHANNEL_STORAGE_WRITE_INDEX, STORAGE_REPLAY_COMPRESSED_BYTES_TOTAL,
-            STORAGE_REPLAY_DECOMPRESSED_BYTES_TOTAL, STORAGE_SEGMENT_CHUNKS_WRITTEN_TOTAL,
+            CHANNEL_STORAGE_WRITE_INDEX, STORAGE_SEGMENT_CHUNKS_WRITTEN_TOTAL,
             STORAGE_WRITE_APPEND_SECONDS_TOTAL, STORAGE_WRITE_CHUNK_COMPRESSED_BYTES_TOTAL,
             STORAGE_WRITE_CHUNK_UNCOMPRESSED_BYTES_TOTAL, STORAGE_WRITE_COMMIT_SECONDS_TOTAL,
             STORAGE_WRITE_COMPRESS_SECONDS_TOTAL, STORAGE_WRITE_ROTATE_SECONDS_TOTAL,
@@ -19,24 +18,26 @@ use {
     },
     ::metrics::{counter, gauge},
     anyhow::{Context, anyhow},
-    prost::encoding::{decode_varint, encode_varint},
+    prost::encoding::encode_varint,
     richat_filter::{
         filter::{FilteredUpdate, FilteredUpdateFilters},
-        message::{Message, MessageParserEncoding, MessageRef},
+        message::MessageRef,
     },
     richat_metrics::duration_to_seconds,
     richat_proto::geyser::SlotStatus,
     solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
     std::{
-        borrow::Cow,
-        collections::{BTreeMap, HashSet},
+        any::Any,
+        collections::{BTreeMap, HashMap, HashSet},
         fs::{File, OpenOptions},
-        io::{Read, Seek, SeekFrom, Write},
+        io::{Seek, SeekFrom, Write},
         path::PathBuf,
+        sync::{Arc, Weak},
         thread,
         time::Instant,
     },
-    zstd::{bulk::Compressor, stream::decode_all as zstd_decode_all},
+    zstd::bulk::Compressor,
 };
 
 /// Compression algorithm used for a chunk payload.
@@ -57,7 +58,7 @@ impl ChunkCompression {
         }
     }
 
-    fn from_tag(tag: u8) -> anyhow::Result<Self> {
+    pub(super) fn from_tag(tag: u8) -> anyhow::Result<Self> {
         match tag {
             Self::TAG_NONE => Ok(Self::None),
             Self::TAG_ZSTD => Ok(Self::Zstd(0)),
@@ -66,178 +67,22 @@ impl ChunkCompression {
     }
 }
 
-/// A single decompressed chunk that yields decoded records as an iterator.
-pub struct DecompressedChunk {
-    first_index: u64,
-    skip: usize,
-    offset: usize,
-    record_index: usize,
-    parser: MessageParserEncoding,
-    data: Vec<u8>,
-}
+// High bit distinguishes commitment-aware records from the original processed-only format.
+pub const COMMITMENT_RECORDS: u8 = 0x80;
 
-impl Iterator for DecompressedChunk {
-    type Item = anyhow::Result<(u64, ParsedMessage)>;
+// Reference-capable chunks keep one payload and append publication references.
+pub const REFERENCE_RECORDS: u8 = 0x40;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.offset >= self.data.len() {
-                return None;
-            }
-
-            let mut slice = &self.data[self.offset..];
-            let record_len: usize = match decode_varint(&mut slice) {
-                Ok(len) => match len.try_into() {
-                    Ok(len) => len,
-                    Err(_) => return Some(Err(anyhow!("record len overflows usize: {len}"))),
-                },
-                Err(error) => return Some(Err(error).context("failed to decode record len")),
-            };
-
-            let Some((record, rest)) = slice.split_at_checked(record_len) else {
-                return Some(Err(anyhow!("record extends past chunk boundary")));
-            };
-
-            self.offset = self.data.len() - rest.len();
-            let record_index = self.record_index;
-            self.record_index += 1;
-            if record_index < self.skip {
-                continue;
-            }
-
-            let mut record_slice = record;
-            if let Err(error) = decode_varint(&mut record_slice) {
-                return Some(Err(error).context("invalid slice size, failed to decode slot"));
-            }
-
-            return Some(
-                Message::parse(Cow::Borrowed(record_slice), self.parser)
-                    .map(|msg| (self.first_index + record_index as u64, msg.into()))
-                    .context("failed to parse message"),
-            );
-        }
-    }
-}
-
-/// Sequential replay reader over chunk metadata and segment files.
-pub struct SegmentReader {
-    parser: MessageParserEncoding,
-    metadata: Metadata,
-    next_index: u64,
-    current_segment_id: Option<u64>,
-    current_file: Option<File>,
-    failed: bool,
-}
-
-impl SegmentReader {
-    pub fn new(metadata: &Metadata, start_index: u64, parser: MessageParserEncoding) -> Self {
-        Self {
-            parser,
-            metadata: metadata.clone(),
-            next_index: start_index,
-            current_segment_id: None,
-            current_file: None,
-            failed: false,
-        }
-    }
-
-    fn open_segment(&mut self, segment_id: u64) -> anyhow::Result<&mut File> {
-        if self.current_segment_id != Some(segment_id) {
-            let path = self
-                .metadata
-                .segments_path()
-                .join(segment_file_name(segment_id));
-            let file = File::open(&path)
-                .with_context(|| format!("failed to open segment file: {path:?}"))?;
-            self.current_segment_id = Some(segment_id);
-            self.current_file = Some(file);
-        }
-
-        self.current_file
-            .as_mut()
-            .context("segment file should be opened")
-    }
-
-    fn load_next_chunk(&mut self) -> anyhow::Result<Option<DecompressedChunk>> {
-        let chunk = {
-            let catalog = self.metadata.catalog();
-            let pos = catalog
-                .chunks
-                .partition_point(|c| c.last_index < self.next_index);
-            match catalog.chunks.get(pos) {
-                Some(&chunk) => chunk,
-                None => return Ok(None),
-            }
-        };
-
-        let file = self.open_segment(chunk.segment_id)?;
-        file.seek(SeekFrom::Start(chunk.offset))?;
-
-        let chunk_size: usize = chunk
-            .size
-            .try_into()
-            .context("chunk size overflows usize")?;
-        // SAFETY: read_exact either fills all bytes or returns Err,
-        // dropping payload without reading uninitialized data.
-        #[allow(clippy::uninit_vec)]
-        let mut payload = unsafe {
-            let mut vec = Vec::with_capacity(chunk_size);
-            vec.set_len(chunk_size);
-            vec
-        };
-        file.read_exact(&mut payload)?;
-        counter!(STORAGE_REPLAY_COMPRESSED_BYTES_TOTAL).increment(payload.len() as u64);
-
-        let compression = ChunkCompression::from_tag(chunk.compression)
-            .context("unsupported chunk compression")?;
-        let uncompressed = match compression {
-            ChunkCompression::None => payload,
-            ChunkCompression::Zstd(_) => {
-                zstd_decode_all(payload.as_slice()).context("failed to decompress chunk")?
-            }
-        };
-        counter!(STORAGE_REPLAY_DECOMPRESSED_BYTES_TOTAL).increment(uncompressed.len() as u64);
-
-        let skip: usize = self
-            .next_index
-            .saturating_sub(chunk.first_index)
-            .try_into()
-            .context("skip offset overflows usize")?;
-        self.next_index = chunk.last_index + 1;
-
-        Ok(Some(DecompressedChunk {
-            first_index: chunk.first_index,
-            skip,
-            offset: 0,
-            record_index: 0,
-            parser: self.parser,
-            data: uncompressed,
-        }))
-    }
-}
-
-impl Iterator for SegmentReader {
-    type Item = anyhow::Result<DecompressedChunk>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-
-        match self.load_next_chunk() {
-            Ok(Some(chunk)) => Some(Ok(chunk)),
-            Ok(None) => None,
-            Err(error) => {
-                self.failed = true;
-                Some(Err(error))
-            }
-        }
-    }
-}
+pub use super::reader::{DecompressedChunk, ReplayRecord, SegmentReader};
 
 #[derive(Debug)]
 pub enum WriterCommand {
+    RestorePayload {
+        index: u64,
+        message: ParsedMessage,
+    },
     PushMessage {
+        commitment: CommitmentLevel,
         init: bool,
         slot: Slot,
         head: u64,
@@ -266,9 +111,97 @@ enum CollectorOutput {
     },
 }
 
+enum RawPayload {
+    Message(ParsedMessage),
+    Reference(u64),
+}
+
 struct RawRecord {
+    commitment: CommitmentLevel,
     slot: Slot,
-    message: ParsedMessage,
+    block: bool,
+    finalized: bool,
+    payload: RawPayload,
+}
+
+impl RawRecord {
+    fn estimated_size(&self) -> usize {
+        match &self.payload {
+            RawPayload::Message(message) => message.size().saturating_add(16),
+            RawPayload::Reference(_) => 32,
+        }
+    }
+}
+
+type PayloadIdentity = (u8, usize);
+type PayloadAllocation = Weak<dyn Any + Send + Sync>;
+
+fn payload_identity(message: &ParsedMessage) -> (PayloadIdentity, PayloadAllocation) {
+    fn identity<T: Any + Send + Sync>(
+        tag: u8,
+        message: &Arc<T>,
+    ) -> (PayloadIdentity, PayloadAllocation) {
+        let allocation: Weak<T> = Arc::downgrade(message);
+        ((tag, Arc::as_ptr(message) as usize), allocation)
+    }
+    match message {
+        ParsedMessage::Slot(message) => identity(0, message),
+        ParsedMessage::Account(message) => identity(1, message),
+        ParsedMessage::Transaction(message) => identity(2, message),
+        ParsedMessage::Entry(message) => identity(3, message),
+        ParsedMessage::BlockMeta(message) => identity(4, message),
+        ParsedMessage::Block(message) => identity(5, message),
+    }
+}
+
+/// Weak allocations prevent pointer reuse without retaining account/block payloads.
+/// Only unrooted slots need an identity map; trimming or rooting frees it.
+#[derive(Default)]
+struct PayloadReferences {
+    slots: BTreeMap<
+        Slot,
+        HashMap<PayloadIdentity, (u64, PayloadAllocation), foldhash::fast::RandomState>,
+    >,
+}
+
+impl PayloadReferences {
+    fn record(
+        &mut self,
+        slot: Slot,
+        index: u64,
+        commitment: CommitmentLevel,
+        message: ParsedMessage,
+    ) -> RawRecord {
+        let (identity, allocation) = payload_identity(&message);
+        let block = matches!(&message, ParsedMessage::Block(_));
+        let finalized = commitment == CommitmentLevel::Processed
+            && matches!(&message, ParsedMessage::Slot(message) if message.status() == SlotStatus::SlotFinalized);
+        let payload = match self.slots.entry(slot).or_default().entry(identity) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                RawPayload::Reference(entry.get().0)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((index, allocation));
+                RawPayload::Message(message)
+            }
+        };
+        if finalized {
+            while self
+                .slots
+                .first_key_value()
+                .is_some_and(|(old, _)| *old <= slot)
+            {
+                self.slots.pop_first();
+            }
+        }
+        RawRecord {
+            commitment,
+            slot,
+            block,
+            finalized,
+            payload,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -288,14 +221,14 @@ struct PendingChunkMeta {
 }
 
 impl PendingChunkMeta {
-    fn push(&mut self, init: bool, slot: Slot, head: u64, index: u64, message: &ParsedMessage) {
+    fn push(&mut self, init: bool, slot: Slot, head: u64, index: u64, record: &RawRecord) {
         if self.record_count == 0 {
             self.first_index = index;
         }
         self.last_index = index;
         self.estimated_uncompressed_size = self
             .estimated_uncompressed_size
-            .saturating_add(message.size().saturating_add(16));
+            .saturating_add(record.estimated_size());
 
         if init {
             self.pending_slots.push(PendingSlot {
@@ -303,9 +236,7 @@ impl PendingChunkMeta {
                 first_index: head,
             });
         }
-        if let ParsedMessage::Slot(message) = message
-            && message.status() == SlotStatus::SlotFinalized
-        {
+        if record.finalized {
             self.pending_finalized.insert(slot);
         }
 
@@ -348,39 +279,67 @@ fn run_collector(
     let mut records: Vec<RawRecord> = Vec::new();
     let mut pending = PendingChunkMeta::default();
     let mut next_seq: u64 = 0;
+    let mut references = PayloadReferences::default();
 
     let mut closed = false;
     while !closed {
         let mut should_flush = false;
         let mut trim = None;
 
-        closed = match rx.recv() {
+        closed = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(command) => {
                 match command {
+                    WriterCommand::RestorePayload { index, message } => {
+                        let (identity, allocation) = payload_identity(&message);
+                        references
+                            .slots
+                            .entry(message.slot())
+                            .or_default()
+                            .insert(identity, (index, allocation));
+                    }
                     WriterCommand::PushMessage {
+                        commitment,
                         init,
                         slot,
                         head,
                         index,
                         message,
                     } => {
-                        pending.push(init, slot, head, index, &message);
-                        records.push(RawRecord { slot, message });
+                        let record = references.record(slot, index, commitment, message);
+                        pending.push(init, slot, head, index, &record);
+                        records.push(record);
                         counter!(CHANNEL_STORAGE_WRITE_COLLECTOR_INDEX).absolute(index);
 
-                        should_flush = pending.should_flush(chunk_target_size);
+                        // Processed is published last for each source event. Keep
+                        // its commitment fan-out in one durable chunk so a crash
+                        // cannot recover half of a promotion and then duplicate it.
+                        should_flush = commitment == CommitmentLevel::Processed
+                            && pending.should_flush(chunk_target_size);
                     }
                     WriterCommand::RemoveReplay { slot, until } => {
+                        references.slots.remove(&slot);
                         should_flush = true;
                         trim = Some((slot, until));
                     }
                 }
                 false
             }
-            Err(_error) => true,
+            Err(kanal::ReceiveErrorTimeout::Timeout) => {
+                should_flush = records
+                    .last()
+                    .is_some_and(|record| record.commitment == CommitmentLevel::Processed);
+                false
+            }
+            Err(_) => true,
         };
 
         if (should_flush || closed) && !pending.is_empty() {
+            anyhow::ensure!(
+                records
+                    .last()
+                    .is_some_and(|record| record.commitment == CommitmentLevel::Processed),
+                "incomplete commitment publication in storage collector"
+            );
             let flushed = std::mem::take(&mut pending);
 
             tx.send(CollectorOutput::RawChunk {
@@ -441,6 +400,7 @@ struct CompressedChunk {
 }
 
 fn spawn_compressor_pool(
+    commitment_mask: u8,
     threads: usize,
     chunk_compression: Option<ChunkCompression>,
     affinity: Option<Vec<usize>>,
@@ -466,7 +426,7 @@ fn spawn_compressor_pool(
                     affinity_linux::set_thread_affinity(cpus.into_iter())
                         .expect("failed to set affinity");
                 }
-                run_compressor(index, chunk_compression, rx, tx)
+                run_compressor(index, commitment_mask, chunk_compression, rx, tx)
             })?;
         handles.push((th_name, Some(jh)));
     }
@@ -475,6 +435,7 @@ fn spawn_compressor_pool(
 
 fn run_compressor(
     thread_index: usize,
+    commitment_mask: u8,
     chunk_compression: Option<ChunkCompression>,
     rx: kanal::Receiver<CollectorOutput>,
     tx: kanal::Sender<CompressorOutput>,
@@ -485,7 +446,10 @@ fn run_compressor(
         }
         _ => None,
     };
-    let compression_tag = chunk_compression.unwrap_or(ChunkCompression::None).tag();
+    let compression_tag = chunk_compression.unwrap_or(ChunkCompression::None).tag()
+        | COMMITMENT_RECORDS
+        | REFERENCE_RECORDS
+        | ((commitment_mask | 1) << 2);
     let thread_index_str: &'static str = thread_index.to_string().leak();
 
     // Per-thread serialization buffers
@@ -507,13 +471,29 @@ fn run_compressor(
                 chunk_buf.clear();
                 for record in &records {
                     record_buf.clear();
-                    let message_ref: MessageRef = (&record.message).into();
-                    let filtered = FilteredUpdate {
-                        filters: FilteredUpdateFilters::new(),
-                        filtered_update: message_ref.into(),
-                    };
+                    let tag = match record.commitment {
+                        CommitmentLevel::Processed => 0,
+                        CommitmentLevel::Confirmed => 1,
+                        CommitmentLevel::Finalized => 2,
+                    } | if record.block { 0x80 } else { 0 }
+                        | if matches!(record.payload, RawPayload::Reference(_)) {
+                            0x40
+                        } else {
+                            0
+                        };
+                    record_buf.push(tag);
                     encode_varint(record.slot, &mut record_buf);
-                    filtered.encode(&mut record_buf);
+                    match &record.payload {
+                        RawPayload::Message(message) => {
+                            let message_ref: MessageRef = message.into();
+                            FilteredUpdate {
+                                filters: FilteredUpdateFilters::new(),
+                                filtered_update: message_ref.into(),
+                            }
+                            .encode(&mut record_buf);
+                        }
+                        RawPayload::Reference(index) => encode_varint(*index, &mut record_buf),
+                    }
                     encode_varint(record_buf.len() as u64, &mut chunk_buf);
                     chunk_buf.extend_from_slice(&record_buf);
                 }
@@ -880,6 +860,7 @@ pub fn spawn_write_pipeline(
         collector_tx,
     )?);
     threads.extend(spawn_compressor_pool(
+        config.commitment_mask(),
         config.compressor_threads,
         config.chunk_compression,
         config.compressor_affinity.clone(),
@@ -899,4 +880,109 @@ pub fn spawn_write_pipeline(
 
 fn segment_file_name(segment_id: u64) -> String {
     format!("{segment_id:012}.seg")
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        prost::Message as _,
+        richat_filter::message::{Message, MessageParserEncoding},
+        richat_proto::geyser::{
+            SubscribeUpdate, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        },
+        std::borrow::Cow,
+    };
+
+    fn slot_bytes(slot: Slot) -> Vec<u8> {
+        SubscribeUpdate {
+            filters: vec![],
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                parent: Some(slot - 1),
+                status: SlotStatus::SlotProcessed as i32,
+                dead_error: None,
+            })),
+            created_at: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 0,
+            }),
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn legacy_processed_records_remain_readable_and_start_is_inclusive() {
+        let mut data = vec![];
+        for slot in 10..13 {
+            let mut record = vec![];
+            encode_varint(slot, &mut record);
+            record.extend(slot_bytes(slot));
+            encode_varint(record.len() as u64, &mut data);
+            data.extend(record);
+        }
+        for parser in [MessageParserEncoding::Prost, MessageParserEncoding::Limited] {
+            let chunk = DecompressedChunk::fixture(42, 0, data.clone(), 3, 1, parser).unwrap();
+            let records = chunk.collect::<anyhow::Result<Vec<_>>>().unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.index)
+                    .collect::<Vec<_>>(),
+                [43, 44]
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.message.slot())
+                    .collect::<Vec<_>>(),
+                [11, 12]
+            );
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.commitment == CommitmentLevel::Processed)
+            );
+        }
+    }
+
+    #[test]
+    fn collector_never_splits_a_commitment_promotion_across_chunks() {
+        let (tx, rx) = kanal::unbounded();
+        let (output_tx, output_rx) = kanal::unbounded();
+        for (index, commitment) in [
+            CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized,
+            CommitmentLevel::Processed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tx.send(WriterCommand::PushMessage {
+                init: index == 0,
+                slot: 10,
+                head: 0,
+                index: index as u64,
+                commitment,
+                message: Message::parse(Cow::Owned(slot_bytes(10)), MessageParserEncoding::Prost)
+                    .unwrap()
+                    .into(),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        run_collector(1, rx, output_tx).unwrap();
+        let CollectorOutput::RawChunk {
+            records,
+            first_index,
+            last_index,
+            ..
+        } = output_rx.recv().unwrap()
+        else {
+            panic!("expected a data chunk")
+        };
+        assert_eq!(records.len(), 3);
+        assert_eq!((first_index, last_index), (0, 2));
+        assert!(output_rx.recv().is_err());
+    }
 }

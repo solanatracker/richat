@@ -5,7 +5,7 @@ use {
     },
     futures::future::{TryFutureExt, ready, try_join_all},
     richat_client::{grpc::ConfigGrpcClient, quic::ConfigQuicClient},
-    richat_filter::message::MessageParserEncoding,
+    richat_filter::{config::ConfigFilterCommitment, message::MessageParserEncoding},
     richat_metrics::ConfigMetrics,
     richat_shared::{
         config::{
@@ -237,12 +237,15 @@ pub struct ConfigStorage {
     /// Metadata RocksDB is stored at `<path>/metadata` and segment files at
     /// `<path>/segments`.
     pub path: PathBuf,
-    /// Retention target in slots; trim remains whole-segment approximate.
+    /// Replay window in slot numbers; physical trim is whole-segment approximate.
     #[serde(
         default = "ConfigStorage::default_max_slots",
         deserialize_with = "deserialize_num_str"
     )]
     pub max_slots: usize,
+    /// Commitments available for disk replay. Defaults to processed only.
+    #[serde(default = "ConfigStorage::default_commitments")]
+    pub commitments: Vec<ConfigFilterCommitment>,
     /// CPU affinity for the collector thread.
     #[serde(default, deserialize_with = "deserialize_affinity")]
     pub serialize_affinity: Option<Vec<usize>>,
@@ -332,6 +335,20 @@ impl ConfigStorage {
 
     const fn default_max_slots() -> usize {
         1024
+    }
+
+    fn default_commitments() -> Vec<ConfigFilterCommitment> {
+        vec![ConfigFilterCommitment::Processed]
+    }
+
+    pub fn commitment_mask(&self) -> u8 {
+        self.commitments.iter().fold(0, |mask, level| {
+            mask | match level {
+                ConfigFilterCommitment::Processed => 1,
+                ConfigFilterCommitment::Confirmed => 2,
+                ConfigFilterCommitment::Finalized => 4,
+            }
+        })
     }
 
     const fn default_segment_target_size() -> usize {

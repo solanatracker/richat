@@ -21,7 +21,7 @@ use {
     smallvec::SmallVec,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    solana_nohash_hasher::IntSet,
+    solana_nohash_hasher::IntMap,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     std::{
@@ -197,6 +197,7 @@ impl ParsedMessage {
                 state.write_u8(1);
                 state.write_u64(msg.slot());
                 state.write(msg.pubkey().as_ref());
+                state.write_u64(msg.write_version());
                 // signature doesn't exist for block reward and system account updates
                 if let Some(signature) = msg.txn_signature() {
                     state.write(signature);
@@ -299,6 +300,13 @@ impl Messages {
         let mut replay = BTreeMap::new();
         let mut index = 0;
         if let Some(storage) = &self.storage {
+            index = storage.next_index();
+            for shared in std::iter::once(&self.shared_processed)
+                .chain(self.shared_confirmed.iter())
+                .chain(self.shared_finalized.iter())
+            {
+                shared.replay_floor.store(index, Ordering::Relaxed);
+            }
             let slots = storage.read_slots();
 
             for (slot, item) in slots.iter() {
@@ -314,14 +322,19 @@ impl Messages {
                 .max()
             {
                 slot_finalized = finalized_slot;
-                let Some(replay_index) = slots.get(&(finalized_slot + 1)).map(|item| item.head)
-                else {
-                    anyhow::bail!("failed to get replay index to load messages");
-                };
+                let replay_index = slots
+                    .range((finalized_slot + 1)..)
+                    .map(|(_, item)| item.head)
+                    .min()
+                    .unwrap_or(index);
                 for chunk_result in storage.read_messages_from_index(replay_index, self.parser) {
                     let mut chunk = chunk_result?;
                     for result in &mut chunk {
-                        let (msg_index, msg) = result?;
+                        let record = result?;
+                        if record.commitment != CommitmentLevel::Processed {
+                            continue;
+                        }
+                        let msg = record.message;
                         if msg.slot() <= finalized_slot {
                             continue;
                         }
@@ -333,13 +346,29 @@ impl Messages {
                             );
                         };
                         let messages = replay.messages.get_or_insert_default();
-                        messages.insert(msg.get_id(hasher.build_hasher()));
-                        index = msg_index + 1;
+                        messages.insert(msg.get_id(hasher.build_hasher()), record.payload_index);
                     }
                 }
                 replay_from_slot = Some(finalized_slot + 1);
             } else {
-                anyhow::ensure!(slots.is_empty(), "no finalized slot in existed db");
+                // An initial capture can be durable before the first root arrives.
+                replay_from_slot = slots.first_key_value().map(|(slot, _)| *slot);
+                for chunk in storage.read_messages_from_index(
+                    slots.values().map(|item| item.head).min().unwrap_or(index),
+                    self.parser,
+                ) {
+                    for record in chunk? {
+                        let record = record?;
+                        if record.commitment == CommitmentLevel::Processed
+                            && let Some(info) = replay.get_mut(&record.message.slot())
+                        {
+                            info.messages.get_or_insert_default().insert(
+                                record.message.get_id(hasher.build_hasher()),
+                                record.payload_index,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -350,16 +379,28 @@ impl Messages {
         let sender = Sender {
             slots: BTreeMap::new(),
             dedup: BTreeMap::new(),
-            processed: SenderShared::new(&self.shared_processed, self.max_messages, self.max_bytes),
-            confirmed: self
-                .shared_confirmed
-                .as_ref()
-                .map(|shared| SenderShared::new(shared, self.max_messages, self.max_bytes)),
-            finalized: self
-                .shared_finalized
-                .as_ref()
-                .map(|shared| SenderShared::new(shared, self.max_messages, self.max_bytes)),
-            slot_confirmed: 0,
+            processed: SenderShared::new(
+                &self.shared_processed,
+                self.max_messages,
+                self.max_bytes,
+                CommitmentLevel::Processed,
+            ),
+            confirmed: self.shared_confirmed.as_ref().map(|shared| {
+                SenderShared::new(
+                    shared,
+                    self.max_messages,
+                    self.max_bytes,
+                    CommitmentLevel::Confirmed,
+                )
+            }),
+            finalized: self.shared_finalized.as_ref().map(|shared| {
+                SenderShared::new(
+                    shared,
+                    self.max_messages,
+                    self.max_bytes,
+                    CommitmentLevel::Finalized,
+                )
+            }),
             slot_finalized,
             global_replay_from_slot: global_replay_from_slot.clone(),
             storage: self.storage.clone(),
@@ -401,31 +442,64 @@ impl Messages {
         replay_from_slot: Option<Slot>,
     ) -> Result<IndexLocation, String> {
         if let Some(replay_from_slot) = replay_from_slot {
-            if commitment == CommitmentLevel::Processed {
-                if let Some(index) = self
-                    .get_shared(commitment)
-                    .slots_lock()
-                    .get(&replay_from_slot)
-                    .map(|obj| obj.head)
+            // Hold the replay map while choosing the cursor: sender publication and
+            // retention use this same lock, so disk and memory describe one boundary.
+            let replay = self.replay_info.as_deref().map(mutex_lock);
+            {
+                let slots = self.get_shared(commitment).slots_lock();
+                if slots
+                    .first_key_value()
+                    .is_some_and(|(first, _)| replay_from_slot >= *first)
+                    && let Some(index) = slots
+                        .range(replay_from_slot..)
+                        .map(|(_, obj)| obj.head)
+                        .min()
                 {
-                    Ok(IndexLocation::Memory(index))
-                } else if let Some(index) = self
-                    .replay_info
-                    .as_deref()
-                    .map(mutex_lock)
-                    .and_then(|replay| replay.get(&replay_from_slot).map(|obj| obj.head))
-                {
-                    Ok(IndexLocation::Storage(index))
-                } else {
-                    Err(format!(
-                        "failed to get replay position for slot {replay_from_slot}"
-                    ))
+                    return Ok(IndexLocation::Memory(index));
                 }
-            } else {
-                Err("replay `from_slot` available only for `processed` commitment".to_owned())
+                let newest = replay
+                    .as_ref()
+                    .and_then(|replay| replay.last_key_value().map(|(slot, _)| *slot))
+                    .or_else(|| slots.last_key_value().map(|(slot, _)| *slot));
+                if newest.is_some_and(|newest| replay_from_slot > newest) {
+                    return Ok(IndexLocation::Memory(self.get_current_tail(commitment) + 1));
+                }
             }
+            if let Some(replay) = replay.as_ref()
+                && self.storage.is_some()
+                && let Some(first) = replay.keys().next()
+                && replay_from_slot < *first
+            {
+                return Err(format!(
+                    "failed to get replay position for slot {replay_from_slot}; first available: {first}"
+                ));
+            }
+            if let Some(replay) = replay.as_ref()
+                && self.storage.is_some()
+                && let Some(index) = replay
+                    .range(replay_from_slot..)
+                    .map(|(_, obj)| obj.head)
+                    .min()
+            {
+                let storage = self.storage.as_ref().unwrap();
+                if !storage.replay_enabled(commitment) {
+                    return Err(format!(
+                        "disk replay is not enabled for {commitment:?}; configure storage.commitments"
+                    ));
+                }
+                if !storage.supports_commitment_replay(index, commitment) {
+                    return Err(
+                        "requested slot predates continuous disk history for this commitment"
+                            .to_owned(),
+                    );
+                }
+                return Ok(IndexLocation::Storage(index));
+            }
+            Err(format!(
+                "failed to get replay position for slot {replay_from_slot}"
+            ))
         } else {
-            let index = self.get_shared(commitment).tail.load(Ordering::Relaxed);
+            let index = self.get_shared(commitment).tail.load(Ordering::Relaxed) + 1;
             Ok(IndexLocation::Memory(index))
         }
     }
@@ -449,6 +523,16 @@ impl Messages {
         }
     }
 
+    pub fn supports_block_replay(&self, head: IndexLocation) -> bool {
+        match head {
+            IndexLocation::Storage(index) => self
+                .storage
+                .as_ref()
+                .is_some_and(|storage| storage.supports_block_replay(index)),
+            _ => true,
+        }
+    }
+
     pub fn storage_disk_size_poll_config(&self) -> Option<(PathBuf, PathBuf, Duration)> {
         self.storage.as_ref().map(|s| s.disk_size_poll_config())
     }
@@ -457,11 +541,18 @@ impl Messages {
         &self,
         client: SubscribeClient,
         metric_cpu_usage: Gauge,
+        commitment: CommitmentLevel,
+        generation: u64,
     ) -> Result<(), &'static str> {
         self.storage
             .as_ref()
             .ok_or("storage should exists to replay messages")?
-            .replay(client, Arc::clone(&self.shared_processed), metric_cpu_usage)
+            .replay(
+                client,
+                Arc::clone(self.get_shared(commitment)),
+                metric_cpu_usage,
+                generation,
+            )
     }
 }
 
@@ -509,7 +600,6 @@ pub struct Sender {
     processed: SenderShared,
     confirmed: Option<SenderShared>,
     finalized: Option<SenderShared>,
-    slot_confirmed: Slot,
     slot_finalized: Slot,
     global_replay_from_slot: GlobalReplayFromSlot,
     storage: Option<Storage>,
@@ -615,6 +705,9 @@ impl Sender {
             messages.push(message.into());
         }
 
+        if messages.is_empty() {
+            return;
+        }
         // push messages
         let mut replay_lock = mutex_lock(&self.replay);
         let (replay, replay_inserted) = match replay_lock.entry(slot) {
@@ -630,19 +723,23 @@ impl Sender {
             )
             .increment(1);
 
-            let mut slot_init = false;
-            let slot_info = self.slots.entry(slot).or_insert_with(|| {
-                slot_init = true;
-                SlotInfo::new(slot, self.index)
-            });
+            let slot_info = self
+                .slots
+                .entry(slot)
+                .or_insert_with(|| SlotInfo::new(slot, replay.head));
             let slot_index_head = slot_info.index;
             let block_message = slot_info.get_block_message(&message);
 
             for message in [Some(message), block_message].into_iter().flatten() {
-                if let Some(messages) = &mut replay.messages
-                    && !messages.insert(message.get_id(self.hasher.build_hasher()))
-                {
-                    continue;
+                if let Some(messages) = &mut replay.messages {
+                    let id = message.get_id(self.hasher.build_hasher());
+                    if let Some(&index) = messages.get(&id) {
+                        if let Some(storage) = &self.storage {
+                            storage.restore_payload(index, message.clone());
+                        }
+                        continue;
+                    }
+                    messages.insert(id, self.index);
                 }
 
                 // update metrics, push messages to confirmed / finalized
@@ -661,34 +758,50 @@ impl Sender {
                         let processed_slots_len = self.processed.shared.slots_lock().len();
                         debug!(
                             "new processed {slot} / {} messages / {} slots / {} bytes",
-                            self.processed.tail - self.processed.head,
+                            self.processed.tail + 1 - self.processed.head,
                             processed_slots_len,
                             self.processed.bytes_total
                         );
 
                         gauge!(metrics::CHANNEL_MESSAGES_TOTAL)
-                            .set((self.processed.tail - self.processed.head) as f64);
+                            .set((self.processed.tail + 1 - self.processed.head) as f64);
                         gauge!(metrics::CHANNEL_SLOTS_TOTAL).set(processed_slots_len as f64);
                         gauge!(metrics::CHANNEL_BYTES_TOTAL).set(self.processed.bytes_total as f64);
                     }
 
                     // push slot message to confirmed / finalized
                     if let Some(shared) = self.confirmed.as_mut() {
-                        shared.push(slot, message.clone(), None);
+                        shared.push_stored(
+                            slot,
+                            message.clone(),
+                            &self.storage,
+                            &mut self.index,
+                            slot_index_head,
+                        );
                     }
                     if let Some(shared) = self.finalized.as_mut() {
-                        shared.push(slot, message.clone(), None);
+                        shared.push_stored(
+                            slot,
+                            message.clone(),
+                            &self.storage,
+                            &mut self.index,
+                            slot_index_head,
+                        );
                     }
 
                     // push messages to confirmed
-                    if msg.status() == SlotStatus::SlotConfirmed {
-                        self.slot_confirmed = slot;
-                        if let Some(shared) = self.confirmed.as_mut()
-                            && let Some(slot_info) = self.slots.get(&slot)
-                        {
-                            for message in slot_info.get_messages_cloned() {
-                                shared.push(slot, message, None);
-                            }
+                    if msg.status() == SlotStatus::SlotConfirmed
+                        && let Some(shared) = self.confirmed.as_mut()
+                        && let Some(slot_info) = self.slots.get(&slot)
+                    {
+                        for message in slot_info.get_messages_cloned() {
+                            shared.push_stored(
+                                slot,
+                                message,
+                                &self.storage,
+                                &mut self.index,
+                                slot_index_head,
+                            );
                         }
                     }
 
@@ -701,38 +814,39 @@ impl Sender {
                             && let Some(mut slot_info) = self.slots.remove(&slot)
                         {
                             for message in slot_info.get_messages_owned() {
-                                shared.push(slot, message, None);
+                                shared.push_stored(
+                                    slot,
+                                    message,
+                                    &self.storage,
+                                    &mut self.index,
+                                    slot_index_head,
+                                );
                             }
                         }
                     }
                 } else {
                     // push to confirmed (if we received SlotStatus or message after it)
-                    if slot <= self.slot_confirmed
+                    if self.slots.get(&slot).is_some_and(|info| info.confirmed)
                         && let Some(shared) = self.confirmed.as_mut()
                     {
-                        shared.push(slot, message.clone(), None);
+                        shared.push_stored(
+                            slot,
+                            message.clone(),
+                            &self.storage,
+                            &mut self.index,
+                            slot_index_head,
+                        );
                     }
                 }
 
-                // push to storage
-                let mut replay_index = None;
-                if let Some(storage) = &self.storage
-                    && !matches!(&message, ParsedMessage::Block(_))
-                {
-                    storage.push_message(
-                        slot_init,
-                        slot,
-                        slot_index_head,
-                        self.index,
-                        message.clone(),
-                    );
-                    slot_init = false;
-                    replay_index = Some(self.index);
-                    self.index += 1;
-                }
-
-                // push to processed
-                self.processed.push(slot, message, replay_index);
+                // Journal exactly the same events as each live commitment stream.
+                self.processed.push_stored(
+                    slot,
+                    message,
+                    &self.storage,
+                    &mut self.index,
+                    slot_index_head,
+                );
             }
         }
 
@@ -753,19 +867,29 @@ impl Sender {
                     _ => break,
                 }
             }
-            while replay_lock.len() > self.storage_max_slots {
+        }
+        if self.storage.is_some() {
+            let first_retained = replay_lock
+                .last_key_value()
+                .map(|(slot, _)| {
+                    slot.saturating_sub(self.storage_max_slots.saturating_sub(1) as u64)
+                })
+                .unwrap_or_default();
+            while replay_lock
+                .first_key_value()
+                .is_some_and(|(slot, _)| *slot < first_retained)
+            {
                 if let Some((slot, _replay)) = replay_lock.pop_first()
                     && let Some(storage) = &self.storage
                 {
-                    let until = replay_lock
-                        .values()
-                        .take(300)
-                        .map(|replay| replay.head)
-                        .min();
+                    let until = replay_lock.values().map(|replay| replay.head).min();
 
                     storage.trim_messages(slot, until);
                 }
             }
+        }
+        if self.storage.is_none() {
+            replay_lock.clear();
         }
         if replay_inserted || clean_after_finalized {
             gauge!(metrics::CHANNEL_STORAGE_SLOTS_TOTAL).set(replay_lock.len() as f64);
@@ -783,22 +907,63 @@ impl Sender {
 
 #[derive(Debug)]
 struct SenderShared {
+    commitment: CommitmentLevel,
     shared: Arc<SharedChannel>,
     head: u64,
     tail: u64,
     bytes_total: usize,
     bytes_max: usize,
+    incomplete_through: Option<Slot>,
 }
 
 impl SenderShared {
-    fn new(shared: &Arc<SharedChannel>, max_messages: usize, max_bytes: usize) -> Self {
+    fn new(
+        shared: &Arc<SharedChannel>,
+        max_messages: usize,
+        max_bytes: usize,
+        commitment: CommitmentLevel,
+    ) -> Self {
         Self {
+            commitment,
             shared: Arc::clone(shared),
             head: max_messages as u64 + 1,
             tail: max_messages as u64,
             bytes_total: 0,
             bytes_max: max_bytes,
+            incomplete_through: None,
         }
+    }
+
+    fn push_stored(
+        &mut self,
+        slot: Slot,
+        message: ParsedMessage,
+        storage: &Option<Storage>,
+        index: &mut u64,
+        slot_head: u64,
+    ) {
+        // Processed records are also the restart/deduplication journal, even
+        // when only higher commitments are exposed for disk replay.
+        let replay_index = storage
+            .as_ref()
+            .filter(|storage| {
+                self.commitment == CommitmentLevel::Processed
+                    || storage.replay_enabled(self.commitment)
+            })
+            .map(|storage| {
+                let current = *index;
+                storage.push_message(
+                    current == slot_head,
+                    slot,
+                    slot_head,
+                    current,
+                    message.clone(),
+                    self.commitment,
+                );
+                *index += 1;
+                current
+            });
+        self.push(slot, message, replay_index);
     }
 
     fn push(&mut self, slot: Slot, message: ParsedMessage, replay_index: Option<u64>) {
@@ -817,6 +982,11 @@ impl SenderShared {
             self.head = self.head.wrapping_add(1);
             self.bytes_total -= message.size();
             removed_max_slot = Some(item.slot);
+            if item.replay_index != u64::MAX {
+                self.shared
+                    .replay_floor
+                    .store(item.replay_index + 1, Ordering::Relaxed);
+            }
         }
         item.replay_index = replay_index.unwrap_or(u64::MAX);
         item.pos = self.tail;
@@ -834,6 +1004,11 @@ impl SenderShared {
 
             self.head = self.head.wrapping_add(1);
             self.bytes_total -= message.size();
+            if item.replay_index != u64::MAX {
+                self.shared
+                    .replay_floor
+                    .store(item.replay_index + 1, Ordering::Relaxed);
+            }
             removed_max_slot = Some(match removed_max_slot {
                 Some(slot) => item.slot.max(slot),
                 None => item.slot,
@@ -841,15 +1016,23 @@ impl SenderShared {
         }
 
         // store new position for receivers
+        self.shared.head.store(self.head, Ordering::Relaxed);
         self.shared.tail.store(self.tail, Ordering::Relaxed);
 
         // update slot head info
-        slots_lock
-            .entry(slot)
-            .or_insert_with(|| SlotHead { head: self.tail });
+        if self
+            .incomplete_through
+            .is_none_or(|incomplete| slot > incomplete)
+        {
+            slots_lock
+                .entry(slot)
+                .or_insert_with(|| SlotHead { head: self.tail });
+        }
 
         // remove not-complete slots
         if let Some(remove_upto) = removed_max_slot {
+            let remove_upto = self.incomplete_through.unwrap_or_default().max(remove_upto);
+            self.incomplete_through = Some(remove_upto);
             loop {
                 match slots_lock.first_key_value() {
                     Some((slot, _)) if *slot <= remove_upto => {
@@ -952,7 +1135,7 @@ impl ReceiverSync {
         };
 
         let tail = shared.tail.load(Ordering::Relaxed);
-        if head < tail {
+        if head <= tail {
             let idx = shared.get_idx(head);
             let item = shared.buffer_idx(idx);
             if item.pos != head {
@@ -967,6 +1150,8 @@ impl ReceiverSync {
 }
 
 pub struct SharedChannel {
+    head: AtomicU64,
+    replay_floor: AtomicU64,
     tail: AtomicU64,
     mask: u64,
     buffer: Box<[Mutex<Item>]>,
@@ -981,7 +1166,7 @@ impl fmt::Debug for SharedChannel {
 }
 
 impl SharedChannel {
-    fn new(max_messages: usize, richat: bool) -> Self {
+    pub(crate) fn new(max_messages: usize, richat: bool) -> Self {
         let mut buffer = Vec::with_capacity(max_messages);
         for i in 0..max_messages {
             buffer.push(Mutex::new(Item {
@@ -993,6 +1178,8 @@ impl SharedChannel {
         }
 
         Self {
+            head: AtomicU64::new(max_messages as u64 + 1),
+            replay_floor: AtomicU64::new(0),
             tail: AtomicU64::new(max_messages as u64),
             mask: (max_messages - 1) as u64,
             buffer: buffer.into_boxed_slice(),
@@ -1002,51 +1189,24 @@ impl SharedChannel {
     }
 
     pub fn get_head_by_replay_index(&self, replay_index: u64) -> Option<u64> {
-        // trying to find head
-        let tail = self.tail.load(Ordering::Relaxed);
-        let mut head = tail - self.mask;
-        let mut size = tail - head + 1;
-        while size > 1 {
-            let half = size / 2;
-            let mid = head + half;
-
-            let idx = self.get_idx(mid);
-            let item = self.buffer_idx(idx);
-            if item.pos != mid || item.replay_index == u64::MAX {
-                head = mid;
-            }
-
-            size -= half;
-        }
-
-        // verify head
-        let idx = self.get_idx(head);
-        let item = self.buffer_idx(idx);
-        if item.pos != head || item.replay_index == u64::MAX {
+        // All stream records carry increasing journal indices. Protect the ring
+        // against concurrent eviction while finding the first not-yet-replayed event.
+        let _guard = self.slots_lock();
+        if replay_index < self.replay_floor.load(Ordering::Relaxed) {
             return None;
         }
-        drop(item);
-
-        // trying to find position for replay_index
-        let mut size = tail - head + 1;
-        while size > 1 {
-            let half = size / 2;
-            let mid = head + half;
-
-            let idx = self.get_idx(mid);
-            let item = self.buffer_idx(idx);
-            head = match item.replay_index.cmp(&replay_index) {
-                std::cmp::Ordering::Equal => return Some(item.pos),
-                std::cmp::Ordering::Less => mid,
-                std::cmp::Ordering::Greater => head,
-            };
-
-            size -= half;
+        let mut low = self.head.load(Ordering::Relaxed);
+        let mut high = self.tail.load(Ordering::Relaxed) + 1;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let item = self.buffer_idx(self.get_idx(mid));
+            if item.replay_index < replay_index {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
-
-        let idx = self.get_idx(head);
-        let item = self.buffer_idx(idx);
-        (item.replay_index == replay_index).then_some(item.pos)
+        Some(low)
     }
 
     #[inline]
@@ -1117,6 +1277,7 @@ struct SlotHead {
 struct SlotInfo {
     slot: Slot,
     block_created: bool,
+    confirmed: bool,
     failed: bool,
     landed: bool,
     messages: Vec<Option<ParsedMessage>>,
@@ -1160,6 +1321,7 @@ impl SlotInfo {
         Self {
             slot,
             block_created: false,
+            confirmed: false,
             failed: false,
             landed: false,
             messages: Vec::with_capacity(16_384),
@@ -1180,6 +1342,12 @@ impl SlotInfo {
             )
         {
             self.landed = true;
+        }
+
+        if let ParsedMessage::Slot(status) = message
+            && status.status() == SlotStatus::SlotConfirmed
+        {
+            self.confirmed = true;
         }
 
         // report error if block already created
@@ -1221,6 +1389,8 @@ impl SlotInfo {
                     if entry.0 < write_version {
                         self.messages[entry.1] = None;
                         *entry = (write_version, idx_new);
+                    } else {
+                        self.messages[idx_new] = None;
                     }
                 } else {
                     self.accounts_dedup
@@ -1297,7 +1467,7 @@ impl SlotInfo {
 #[derive(Debug)]
 struct ReplayInfo {
     head: u64,
-    messages: Option<IntSet<u64>>,
+    messages: Option<IntMap<u64, u64>>,
 }
 
 impl ReplayInfo {
@@ -1370,3 +1540,7 @@ enum DedupInfoTransactionIndex {
     Index(usize),
     Accounts(Vec<MessageAccount>),
 }
+
+#[cfg(test)]
+#[path = "channel_tests.rs"]
+mod replay_tests;

@@ -369,6 +369,12 @@ impl GrpcServer {
                     }
                 };
 
+                if state
+                    .replay_from_slot
+                    .is_some_and(|slot| message.slot() < slot)
+                {
+                    continue;
+                }
                 let message_ref: MessageRef = message.as_ref().into();
                 if let Some(filter) = state.filter.as_ref() {
                     let items = filter
@@ -522,33 +528,50 @@ impl GrpcServer {
                             let mut state = client.state_lock();
                             let was_unset = state.filter.is_none();
                             if let Err(error) = new_filter.and_then(|filter| {
-                                if filter.contains_blocks() && subscribe_from_slot.is_some() {
+                                let commitment = filter.commitment().into();
+                                let new_head = if state.filter.is_none()
+                                    || commitment != state.commitment
+                                    || subscribe_from_slot.is_some()
+                                {
+                                    Some(
+                                        messages
+                                            .get_current_tail_with_replay(
+                                                commitment,
+                                                subscribe_from_slot,
+                                            )
+                                            .map_err(Status::invalid_argument)?,
+                                    )
+                                } else {
+                                    None
+                                };
+                                if filter.contains_blocks()
+                                    && !messages
+                                        .supports_block_replay(new_head.unwrap_or(state.head))
+                                {
                                     return Err(Status::invalid_argument(
-                                        "blocks are not possible to replay",
+                                        "requested slot predates block-aware disk storage",
                                     ));
                                 }
-
-                                let commitment_prev = state.commitment;
-                                state.commitment = filter.commitment().into();
-                                if state.filter.is_none() || state.commitment != commitment_prev {
-                                    let current_head = state.head;
-                                    state.head = messages
-                                        .get_current_tail_with_replay(
-                                            state.commitment,
-                                            subscribe_from_slot,
-                                        )
-                                        .map_err(Status::invalid_argument)?;
-                                    if !matches!(current_head, IndexLocation::Storage(_))
-                                        && matches!(state.head, IndexLocation::Storage(_))
-                                    {
+                                if let Some(head) = new_head {
+                                    let generation = state.replay_generation.wrapping_add(1);
+                                    if matches!(head, IndexLocation::Storage(_)) {
                                         let metric_cpu_usage = gauge!(
                                             metrics::GRPC_SUBSCRIBE_REPLAY_DISK_SECONDS_TOTAL,
                                             "x_subscription_id" => Arc::clone(&x_subscription_id)
                                         );
                                         messages
-                                            .replay_from_storage(client.clone(), metric_cpu_usage)
-                                            .map_err(Status::internal)?;
+                                            .replay_from_storage(
+                                                client.clone(),
+                                                metric_cpu_usage,
+                                                commitment,
+                                                generation,
+                                            )
+                                            .map_err(Status::resource_exhausted)?;
                                     }
+                                    state.head = head;
+                                    state.commitment = commitment;
+                                    state.replay_generation = generation;
+                                    state.replay_from_slot = subscribe_from_slot;
                                 }
                                 state.filter = Some(filter);
                                 if was_unset {
@@ -557,6 +580,7 @@ impl GrpcServer {
                                 Ok::<(), Status>(())
                             }) {
                                 warn!(id, %error, "failed to handle request");
+                                state.finished = true;
                                 drop(state);
                                 client.push_error(error);
                             } else {
@@ -831,7 +855,7 @@ pub struct SubscribeClient {
 }
 
 impl SubscribeClient {
-    fn new(
+    pub(crate) fn new(
         id: u64,
         messages_len_max: usize,
         messages_replay_len_max: usize,
@@ -847,6 +871,16 @@ impl SubscribeClient {
             waker: Arc::new(AtomicWaker::new()),
             x_subscription_id,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_for_test(&self) -> Option<Result<Vec<u8>, Status>> {
+        self.messages.pop().map(|item| {
+            item.map(|(_, data)| {
+                self.messages_len.fetch_sub(data.len(), Ordering::Relaxed);
+                data
+            })
+        })
     }
 
     #[inline]
@@ -876,7 +910,9 @@ pub struct SubscribeClientState {
     pub finished: bool, // check in workers with acquired mutex
     id: u64,
     x_subscription_id: Arc<str>,
-    commitment: CommitmentLevel,
+    pub commitment: CommitmentLevel,
+    pub replay_generation: u64,
+    pub replay_from_slot: Option<Slot>,
     pub head: IndexLocation,
     pub filter: Option<Filter>,
     metric_cpu_usage: Gauge,
@@ -918,6 +954,8 @@ impl SubscribeClientState {
             id,
             x_subscription_id,
             commitment: CommitmentLevel::default(),
+            replay_generation: 0,
+            replay_from_slot: None,
             head: IndexLocation::Unknown,
             filter: None,
             metric_cpu_usage,
@@ -1093,4 +1131,27 @@ impl MessagesCache {
 struct MessagesCacheItem {
     pos: u64,
     msg: Option<ParsedMessage>,
+}
+
+#[cfg(test)]
+impl GrpcServer {
+    pub(crate) fn test_service(
+        messages: Messages,
+        shutdown: CancellationToken,
+    ) -> (Self, std::thread::JoinHandle<anyhow::Result<()>>) {
+        let service = Self {
+            shutdown: shutdown.clone(),
+            messages,
+            block_meta: None,
+            filter_limits: Arc::new(ConfigFilterLimits::default()),
+            ping_interval: Duration::from_secs(60),
+            subscribe_id: Arc::new(AtomicU64::new(0)),
+            subscribe_clients: Arc::new(SegQueue::new()),
+            subscribe_messages_len_max: 4096,
+            subscribe_messages_replay_len_max: 4096,
+        };
+        let worker = service.clone();
+        let thread = std::thread::spawn(move || worker.worker_messages(0, 128, 100, 100, shutdown));
+        (service, thread)
+    }
 }
