@@ -8,18 +8,18 @@ use {
     },
     solana_account_decoder::parse_token::UiTokenAmount,
     solana_clock::Slot,
-    solana_message_v3::{
+    solana_message::{
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
-        v0::MessageAddressTableLookup,
+        v0::MessageAddressTableLookup, v1::TransactionConfig,
     },
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::{SIGNATURE_BYTES, Signature},
+    solana_transaction::versioned::VersionedTransaction,
     solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         InnerInstruction, InnerInstructions, TransactionStatusMeta, TransactionTokenBalance,
     },
-    solana_transaction_v3::versioned::VersionedTransaction,
     std::{cell::RefCell, marker::PhantomData, ops::Deref},
 };
 
@@ -145,7 +145,7 @@ impl Message for ReplicaWrapper<'_> {
 }
 
 #[derive(Debug)]
-struct VersionedTransactionWrapper<'a>(&'a VersionedTransaction);
+pub(super) struct VersionedTransactionWrapper<'a>(pub(super) &'a VersionedTransaction);
 
 impl Deref for VersionedTransactionWrapper<'_> {
     type Target = VersionedTransaction;
@@ -246,6 +246,18 @@ impl Message for VersionedMessageWrapper<'_> {
                     buf,
                 );
             }
+            VersionedMessage::V1(message) => {
+                encoding::message::encode(1, &MessageHeaderWrapper(message.header), buf);
+                pubkeys_encode(2, &message.account_keys, buf);
+                bytes_encode(3, message.lifetime_specifier.as_ref(), buf);
+                encoding::message::encode_repeated(
+                    4,
+                    CompiledInstructionWrapper::new(&message.instructions),
+                    buf,
+                );
+                versioned_encode(5, true, buf);
+                encoding::message::encode(7, &TransactionConfigWrapper(&message.config), buf);
+            }
         }
     }
 
@@ -279,7 +291,81 @@ impl Message for VersionedMessageWrapper<'_> {
                         MessageAddressTableLookupWrapper::new(&message.address_table_lookups),
                     )
             }
+            VersionedMessage::V1(message) => {
+                encoding::message::encoded_len(1, &MessageHeaderWrapper(message.header))
+                    + pubkeys_encoded_len(2, &message.account_keys)
+                    + bytes_encoded_len(3, message.lifetime_specifier.as_ref())
+                    + encoding::message::encoded_len_repeated(
+                        4,
+                        CompiledInstructionWrapper::new(&message.instructions),
+                    )
+                    + versioned_encoded_len(5, true)
+                    + encoding::message::encoded_len(7, &TransactionConfigWrapper(&message.config))
+            }
         }
+    }
+
+    fn clear(&mut self) {
+        unimplemented!()
+    }
+
+    fn merge_field(
+        &mut self,
+        _tag: u32,
+        _wire_type: WireType,
+        _buf: &mut impl Buf,
+        _ctx: DecodeContext,
+    ) -> Result<(), DecodeError>
+    where
+        Self: Sized,
+    {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug)]
+struct TransactionConfigWrapper<'a>(&'a TransactionConfig);
+
+impl Deref for TransactionConfigWrapper<'_> {
+    type Target = TransactionConfig;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl Message for TransactionConfigWrapper<'_> {
+    fn encode_raw(&self, buf: &mut impl BufMut)
+    where
+        Self: Sized,
+    {
+        if let Some(priority_fee) = self.priority_fee {
+            encoding::uint64::encode(1, &priority_fee, buf);
+        }
+        if let Some(compute_unit_limit) = self.compute_unit_limit {
+            encoding::uint32::encode(2, &compute_unit_limit, buf);
+        }
+        if let Some(loaded_accounts_data_size_limit) = self.loaded_accounts_data_size_limit {
+            encoding::uint32::encode(3, &loaded_accounts_data_size_limit, buf);
+        }
+        if let Some(heap_size) = self.heap_size {
+            encoding::uint32::encode(4, &heap_size, buf);
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.priority_fee.map_or(0, |priority_fee| {
+            encoding::uint64::encoded_len(1, &priority_fee)
+        }) + self.compute_unit_limit.map_or(0, |compute_unit_limit| {
+            encoding::uint32::encoded_len(2, &compute_unit_limit)
+        }) + self
+            .loaded_accounts_data_size_limit
+            .map_or(0, |loaded_accounts_data_size_limit| {
+                encoding::uint32::encoded_len(3, &loaded_accounts_data_size_limit)
+            })
+            + self
+                .heap_size
+                .map_or(0, |heap_size| encoding::uint32::encoded_len(4, &heap_size))
     }
 
     fn clear(&mut self) {
@@ -367,13 +453,13 @@ impl Message for MessageHeaderWrapper {
     }
 }
 
-fn pubkeys_encode(tag: u32, pubkeys: &[Pubkey], buf: &mut impl BufMut) {
+pub(super) fn pubkeys_encode(tag: u32, pubkeys: &[Pubkey], buf: &mut impl BufMut) {
     for pubkey in pubkeys {
         bytes_encode(tag, pubkey.as_ref(), buf);
     }
 }
 
-const fn pubkeys_encoded_len(tag: u32, pubkeys: &[Pubkey]) -> usize {
+pub(super) const fn pubkeys_encoded_len(tag: u32, pubkeys: &[Pubkey]) -> usize {
     (key_len(tag) + encoded_len_varint(PUBKEY_BYTES as u64) + PUBKEY_BYTES) * pubkeys.len()
 }
 

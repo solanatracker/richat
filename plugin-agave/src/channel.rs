@@ -132,24 +132,34 @@ impl Sender {
         state.tail = state.tail.wrapping_add(1);
 
         // update slots info
-        let slot = message.get_slot();
-        let head = state.tail;
-        let entry = state.slots.entry(slot).or_insert_with(|| SlotInfo {
-            head,
-            parent_slot: None,
-            confirmed: false,
-            finalized: false,
-        });
-        if let ProtobufMessage::Slot { parent, status, .. } = &message {
-            if let Some(parent) = parent {
-                entry.parent_slot = Some(*parent);
+        // messages not related to any slot (contact info) are attached to the latest known slot
+        let slot = match message.get_slot() {
+            Some(slot) => {
+                let head = state.tail;
+                let entry = state.slots.entry(slot).or_insert_with(|| SlotInfo {
+                    head,
+                    parent_slot: None,
+                    confirmed: false,
+                    finalized: false,
+                });
+                if let ProtobufMessage::Slot { parent, status, .. } = &message {
+                    if let Some(parent) = parent {
+                        entry.parent_slot = Some(*parent);
+                    }
+                    if **status == SlotStatus::Confirmed {
+                        entry.confirmed = true;
+                    } else if **status == SlotStatus::Rooted {
+                        entry.finalized = true;
+                    }
+                }
+                slot
             }
-            if **status == SlotStatus::Confirmed {
-                entry.confirmed = true;
-            } else if **status == SlotStatus::Rooted {
-                entry.finalized = true;
-            }
-        }
+            None => state
+                .slots
+                .last_key_value()
+                .map(|(slot, _info)| *slot)
+                .unwrap_or_default(),
+        };
 
         // lock and update item
         state.bytes_total += data.len();
@@ -259,6 +269,10 @@ impl Subscribe for Sender {
             enable_notifications_accounts: !filter.disable_accounts,
             enable_notifications_transactions: !filter.disable_transactions,
             enable_notifications_entries: !filter.disable_entries,
+            enable_notifications_deshred_transactions: filter.enable_deshred_transactions,
+            enable_notifications_contact_info: filter.enable_contact_info,
+            enable_notifications_block_footers: filter.enable_block_footers,
+            enable_notifications_entry_update_parents: filter.enable_entry_update_parents,
         }
         .boxed())
     }
@@ -272,6 +286,10 @@ pub struct Receiver {
     enable_notifications_accounts: bool,
     enable_notifications_transactions: bool,
     enable_notifications_entries: bool,
+    enable_notifications_deshred_transactions: bool,
+    enable_notifications_contact_info: bool,
+    enable_notifications_block_footers: bool,
+    enable_notifications_entry_update_parents: bool,
 }
 
 impl Receiver {
@@ -318,6 +336,22 @@ impl Receiver {
                     continue;
                 }
                 PluginNotification::Entry if !self.enable_notifications_entries => continue,
+                PluginNotification::DeshredTransaction
+                    if !self.enable_notifications_deshred_transactions =>
+                {
+                    continue;
+                }
+                PluginNotification::ContactInfo if !self.enable_notifications_contact_info => {
+                    continue;
+                }
+                PluginNotification::BlockFooter if !self.enable_notifications_block_footers => {
+                    continue;
+                }
+                PluginNotification::EntryUpdateParent
+                    if !self.enable_notifications_entry_update_parents =>
+                {
+                    continue;
+                }
                 _ => {}
             }
             break Ok(Some(item));

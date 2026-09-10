@@ -12,12 +12,45 @@ mod tests {
         super::{ProtobufEncoder, ProtobufMessage},
         prost::Message,
         richat_benches::fixtures::{
-            generate_accounts, generate_block_metas, generate_entries, generate_slots,
-            generate_transactions,
+            generate_accounts, generate_block_footers, generate_block_metas,
+            generate_contact_infos, generate_deshred_transactions, generate_entries,
+            generate_slots, generate_transactions, generate_update_parents,
         },
-        richat_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
+        richat_proto::{
+            geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
+            richat::{
+                SubscribeUpdateRichat, subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
+            },
+        },
         std::time::SystemTime,
     };
+
+    fn assert_richat_encoding(
+        msg_richat: &ProtobufMessage<'_>,
+        update_oneof: UpdateOneofRichat,
+        created_at: SystemTime,
+        name: &str,
+    ) {
+        let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
+        let vec_richat2 = msg_richat.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
+        assert_eq!(vec_richat1, vec_richat2, "{name}: {msg_richat:?}");
+
+        let msg_prost = SubscribeUpdateRichat {
+            update_oneof: Some(update_oneof),
+            created_at: Some(created_at.into()),
+        };
+        let vec_prost = msg_prost.encode_to_vec();
+        assert_eq!(vec_richat1, vec_prost, "{name}: {msg_richat:?}");
+
+        // Yellowstone `SubscribeUpdate` should skip Richat-only update
+        let update = SubscribeUpdate::decode(vec_richat1.as_slice()).expect("failed to decode");
+        assert_eq!(update.update_oneof, None, "{name}: {msg_richat:?}");
+        assert_eq!(
+            update.created_at,
+            Some(created_at.into()),
+            "{name}: {msg_richat:?}"
+        );
+    }
 
     #[test]
     pub fn test_encode_account() {
@@ -128,6 +161,91 @@ mod tests {
             };
             let vec_prost = msg_prost.encode_to_vec();
             assert_eq!(vec_richat1, vec_prost, "transaction: {item:?}");
+        }
+    }
+
+    #[test]
+    pub fn test_encode_deshred_transaction() {
+        let created_at = SystemTime::now();
+        for item in generate_deshred_transactions() {
+            let (slot, replica) = item.to_replica();
+            let msg_richat = ProtobufMessage::DeshredTransaction {
+                slot,
+                transaction: &replica,
+            };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::DeshredTransaction(item.to_prost()),
+                created_at,
+                "deshred transaction",
+            );
+        }
+    }
+
+    #[test]
+    pub fn test_encode_contact_info() {
+        let created_at = SystemTime::now();
+        for item in generate_contact_infos() {
+            let replica = item.to_replica();
+            let msg_richat = ProtobufMessage::ContactInfo { info: &replica };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::ContactInfo(item.to_prost()),
+                created_at,
+                "contact info",
+            );
+
+            let msg_richat = ProtobufMessage::ContactInfoRemoved {
+                pubkey: item.pubkey.as_array(),
+            };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::ContactInfoRemoved(item.to_prost_removed()),
+                created_at,
+                "contact info removed",
+            );
+        }
+    }
+
+    #[test]
+    pub fn test_encode_block_footer() {
+        let created_at = SystemTime::now();
+        for item in generate_block_footers() {
+            let msg_richat = ProtobufMessage::BlockFooter {
+                slot: item.slot,
+                bank_id: item.bank_id,
+                block_footer: &item.block_footer,
+            };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::BlockFooter(item.to_prost()),
+                created_at,
+                "block footer",
+            );
+        }
+    }
+
+    #[test]
+    pub fn test_encode_update_parent() {
+        let created_at = SystemTime::now();
+        for item in generate_update_parents() {
+            let replica = item.to_replica_entry();
+            let msg_richat = ProtobufMessage::EntryUpdateParent { info: &replica };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::EntryUpdateParent(item.to_prost_entry()),
+                created_at,
+                "entry update parent",
+            );
+
+            let replica = item.to_replica_deshred();
+            let msg_richat = ProtobufMessage::DeshredUpdateParent { info: &replica };
+            assert_richat_encoding(
+                &msg_richat,
+                UpdateOneofRichat::DeshredUpdateParent(item.to_prost_deshred()),
+                created_at,
+                "deshred update parent",
+            );
         }
     }
 }

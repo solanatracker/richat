@@ -23,6 +23,7 @@ pub struct Config {
     pub metrics: Option<ConfigMetrics>,
     pub tokio: ConfigTokio,
     pub channel: ConfigChannel,
+    pub notifications: ConfigNotifications,
     pub quic: Option<ConfigQuicServer>,
     pub grpc: Option<ConfigGrpcServer>,
 }
@@ -74,6 +75,25 @@ impl Default for ConfigChannel {
             max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
         }
     }
+}
+
+/// Optional Geyser notifications, all disabled by default.
+///
+/// Accounts, transactions, entries, slots and block metadata are always enabled.
+/// Messages produced by these notifications are Richat-only (see `SubscribeUpdateRichat`)
+/// and are only sent to clients that explicitly enable them in `RichatFilter`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigNotifications {
+    /// Transactions reconstructed from shreds before replay (agave 4.1+),
+    /// also enables Alpenglow UpdateParent notifications from the deshred stream.
+    pub deshred_transactions: bool,
+    /// Resolve address lookup tables for deshred transactions
+    pub deshred_transactions_alt_resolution: bool,
+    /// Gossip contact info updates and removals (agave 4.2+)
+    pub contact_info: bool,
+    /// Alpenglow block footers (agave 4.3+)
+    pub block_footers: bool,
 }
 
 impl ConfigChannel {

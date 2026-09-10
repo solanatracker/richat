@@ -23,8 +23,8 @@ publish = false
 
 [workspace.dependencies]
 affinity-linux = "1.0.0"
-agave-geyser-plugin-interface = "~4.0.0-rc.0" # agave repo
-agave-reserved-account-keys = "~4.0.0-rc.0" # agave repo
+agave-geyser-plugin-interface = "~4.3.0-rc.0" # agave repo
+agave-reserved-account-keys = "~4.3.0-rc.0" # agave repo
 anyhow = "1.0.62"
 arrayvec = "0.7.6"
 base64 = "0.22.1"
@@ -60,7 +60,6 @@ metrics-exporter-prometheus = { version = "0.18.1", default-features = false }
 pin-project-lite = "0.2.15"
 prost = "0.14.1"
 prost-types = "0.14.1"
-prost_011 = { package = "prost", version = "0.11.9" }
 protoc-bin-vendored = "3.2.0"
 quanta = "0.12.5"
 quinn = "0.11.6"
@@ -68,12 +67,12 @@ rayon = "1.10.0"
 rcgen = "0.14.0"
 regex = "1.11.1"
 richat-benches = { path = "benches", version = "1.0.0" }
-richat-client = { path = "client", version = "9.0.0" }
-richat-filter = { path = "filter", version = "9.0.0" }
+richat-client = { path = "client", version = "10.0.0" }
+richat-filter = { path = "filter", version = "10.0.0" }
 richat-metrics = { path = "metrics", version = "1.0.1" }
-richat-plugin-agave = { path = "plugin-agave", version = "9.0.0" }
-richat-proto = { path = "proto", version = "9.0.0" }
-richat-shared = { path = "shared", version = "9.0.0", default-features = false }
+richat-plugin-agave = { path = "plugin-agave", version = "10.0.0" }
+richat-proto = { path = "proto", version = "10.0.0" }
+richat-shared = { path = "shared", version = "10.0.0", default-features = false }
 rocksdb = "0.24.0"
 rustls = { version = "0.23.36", default-features = false }
 rustls-native-certs = "0.8.3"
@@ -84,27 +83,25 @@ serde_yaml = "0.9.33"
 signal-hook = "0.4.3"
 smallvec = "1.13.2"
 socket2 = "0.6.0"
-solana-account = "4.3.0"
-solana-account-decoder = "~4.0.0-rc.0" # agave repo
-solana-account-v3 = { package = "solana-account", version = "3.4.0" }
-solana-clock = "3.0.1"
+solana-account = "4.5.0"
+solana-account-decoder = "~4.3.0-rc.0" # agave repo
+solana-clock = "3.2.0"
 solana-commitment-config = "3.1.1"
-solana-hash = "4.3.0"
+solana-entry = "~4.3.0-rc.0" # agave repo
+solana-hash = "4.6.0"
 solana-logger = "3.0.0"
-solana-message = "4.1.1"
-solana-message-v3 = { package = "solana-message", version = "3.1.0" }
+solana-message = "4.5.0"
 solana-nohash-hasher = "0.2.1"
-solana-pubkey = "4.2.0"
-solana-pubsub-client = "~4.0.0-rc.0" # agave repo
-solana-rpc-client-api = "~4.0.0-rc.0" # agave repo
-solana-signature = "3.4.0"
-solana-storage-proto = "~4.0.0-rc.0" # agave repo
-solana-transaction = "4.1.1"
-solana-transaction-context = "~4.0.0-rc.0" # agave repo
-solana-transaction-error = "3.2.0"
-solana-transaction-v3 = { package = "solana-transaction", version = "3.1.0" }
-solana-transaction-status = "~4.0.0-rc.0" # agave repo
-solana-version = "~4.0.0-rc.0" # agave repo
+solana-pubkey = "4.3.0"
+solana-pubsub-client = "~4.3.0-rc.0" # agave repo
+solana-rpc-client-api = "~4.3.0-rc.0" # agave repo
+solana-signature = "3.5.2"
+solana-storage-proto = "~4.3.0-rc.0" # agave repo
+solana-transaction = "4.2.0"
+solana-transaction-context = "~4.3.0-rc.0" # agave repo
+solana-transaction-error = "3.4.0"
+solana-transaction-status = "~4.3.0-rc.0" # agave repo
+solana-version = "~4.3.0-rc.0" # agave repo
 spl-token-2022-interface = "2.1.0"
 thiserror = "2.0.7"
 tikv-jemallocator = { version = "0.6.0", features = ["unprefixed_malloc_on_supported_platforms"] }
@@ -121,7 +118,8 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 vergen = "9.0.2"
 webpki-roots = "1.0.1"
-yellowstone-grpc-proto = "12.3.0"
+wincode = "0.6.1"
+yellowstone-grpc-proto = "12.7.0"
 zstd = "0.13.3"
 
 [workspace.lints.clippy]

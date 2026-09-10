@@ -2,15 +2,9 @@ use {
     solana_clock::UnixTimestamp,
     solana_message::{
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
-        v0::MessageAddressTableLookup,
-    },
-    solana_message_v3::{
-        MessageHeader as StatusMessageHeader, VersionedMessage as StatusVersionedMessage,
-        compiled_instruction::CompiledInstruction as StatusCompiledInstruction,
-        v0::MessageAddressTableLookup as StatusMessageAddressTableLookup,
+        v0::MessageAddressTableLookup, v1::TransactionConfig,
     },
     solana_pubkey::Pubkey,
-    solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
@@ -18,7 +12,6 @@ use {
         InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
         TransactionTokenBalance,
     },
-    solana_transaction_v3::versioned::VersionedTransaction as StatusVersionedTransaction,
     yellowstone_grpc_proto::prelude as proto,
 };
 
@@ -33,34 +26,6 @@ pub fn create_transaction(tx: &VersionedTransaction) -> proto::Transaction {
     }
 }
 
-pub fn create_status_transaction(tx: &StatusVersionedTransaction) -> proto::Transaction {
-    proto::Transaction {
-        signatures: tx
-            .signatures
-            .iter()
-            .map(|signature| <Signature as AsRef<[u8]>>::as_ref(signature).into())
-            .collect(),
-        message: Some(match &tx.message {
-            StatusVersionedMessage::Legacy(message) => proto::Message {
-                header: Some(create_status_header(&message.header)),
-                account_keys: create_pubkeys(&message.account_keys),
-                recent_blockhash: message.recent_blockhash.to_bytes().into(),
-                instructions: create_status_instructions(&message.instructions),
-                versioned: false,
-                address_table_lookups: vec![],
-            },
-            StatusVersionedMessage::V0(message) => proto::Message {
-                header: Some(create_status_header(&message.header)),
-                account_keys: create_pubkeys(&message.account_keys),
-                recent_blockhash: message.recent_blockhash.to_bytes().into(),
-                instructions: create_status_instructions(&message.instructions),
-                versioned: true,
-                address_table_lookups: create_status_lookups(&message.address_table_lookups),
-            },
-        }),
-    }
-}
-
 pub fn create_message(message: &VersionedMessage) -> proto::Message {
     match message {
         VersionedMessage::Legacy(message) => proto::Message {
@@ -70,6 +35,7 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: false,
             address_table_lookups: vec![],
+            config: None,
         },
         VersionedMessage::V0(message) => proto::Message {
             header: Some(create_header(&message.header)),
@@ -78,16 +44,28 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: true,
             address_table_lookups: create_lookups(&message.address_table_lookups),
+            config: None,
         },
-        VersionedMessage::V1(_) => unimplemented!("V1 transaction messages are not supported"),
+        // V1 (SIMD-0385): the lifetime specifier is carried in `recent_blockhash`,
+        // there are no address table lookups and `config` is always set.
+        VersionedMessage::V1(message) => proto::Message {
+            header: Some(create_header(&message.header)),
+            account_keys: create_pubkeys(&message.account_keys),
+            recent_blockhash: message.lifetime_specifier.to_bytes().into(),
+            instructions: create_instructions(&message.instructions),
+            versioned: true,
+            address_table_lookups: vec![],
+            config: Some(create_transaction_config(&message.config)),
+        },
     }
 }
 
-pub const fn create_status_header(header: &StatusMessageHeader) -> proto::MessageHeader {
-    proto::MessageHeader {
-        num_required_signatures: header.num_required_signatures as u32,
-        num_readonly_signed_accounts: header.num_readonly_signed_accounts as u32,
-        num_readonly_unsigned_accounts: header.num_readonly_unsigned_accounts as u32,
+pub const fn create_transaction_config(config: &TransactionConfig) -> proto::TransactionConfig {
+    proto::TransactionConfig {
+        priority_fee: config.priority_fee,
+        compute_unit_limit: config.compute_unit_limit,
+        loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+        heap_size: config.heap_size,
     }
 }
 
@@ -107,18 +85,6 @@ pub fn create_instructions(ixs: &[CompiledInstruction]) -> Vec<proto::CompiledIn
     ixs.iter().map(create_instruction).collect()
 }
 
-fn create_status_instructions(
-    ixs: &[StatusCompiledInstruction],
-) -> Vec<proto::CompiledInstruction> {
-    ixs.iter()
-        .map(|ix| proto::CompiledInstruction {
-            program_id_index: ix.program_id_index as u32,
-            accounts: ix.accounts.clone(),
-            data: ix.data.clone(),
-        })
-        .collect()
-}
-
 pub fn create_instruction(ix: &CompiledInstruction) -> proto::CompiledInstruction {
     proto::CompiledInstruction {
         program_id_index: ix.program_id_index as u32,
@@ -131,19 +97,6 @@ pub fn create_lookups(
     lookups: &[MessageAddressTableLookup],
 ) -> Vec<proto::MessageAddressTableLookup> {
     lookups.iter().map(create_lookup).collect()
-}
-
-fn create_status_lookups(
-    lookups: &[StatusMessageAddressTableLookup],
-) -> Vec<proto::MessageAddressTableLookup> {
-    lookups
-        .iter()
-        .map(|lookup| proto::MessageAddressTableLookup {
-            account_key: lookup.account_key.as_ref().into(),
-            writable_indexes: lookup.writable_indexes.clone(),
-            readonly_indexes: lookup.readonly_indexes.clone(),
-        })
-        .collect()
 }
 
 pub fn create_lookup(lookup: &MessageAddressTableLookup) -> proto::MessageAddressTableLookup {
@@ -297,6 +250,7 @@ pub const fn create_reward_type(reward_type: Option<RewardType>) -> proto::Rewar
         Some(RewardType::Rent) => proto::RewardType::Rent,
         Some(RewardType::Staking) => proto::RewardType::Staking,
         Some(RewardType::Voting) => proto::RewardType::Voting,
+        Some(RewardType::DeactivatedStake) => proto::RewardType::DeactivatedStake,
     }
 }
 

@@ -7,10 +7,6 @@ use {
     solana_account_decoder::parse_token::UiTokenAmount,
     solana_hash::{HASH_BYTES, Hash},
     solana_instruction_error::InstructionError,
-    solana_message::{
-        LegacyMessage, MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
-        legacy, v0,
-    },
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::{SIGNATURE_BYTES, Signature},
     solana_transaction::versioned::VersionedTransaction,
@@ -20,181 +16,13 @@ use {
         InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
         TransactionTokenBalance,
     },
-    std::{borrow::Cow, time::SystemTime},
+    std::time::SystemTime,
 };
 
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzMessageHeader {
-    num_required_signatures: u8,
-    num_readonly_signed_accounts: u8,
-    num_readonly_unsigned_accounts: u8,
-}
+#[path = "message.rs"]
+mod message;
 
-impl From<FuzzMessageHeader> for MessageHeader {
-    fn from(value: FuzzMessageHeader) -> Self {
-        MessageHeader {
-            num_required_signatures: value.num_required_signatures,
-            num_readonly_signed_accounts: value.num_readonly_signed_accounts,
-            num_readonly_unsigned_accounts: value.num_readonly_unsigned_accounts,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzCompiledInstruction {
-    program_id_index: u8,
-    accounts: Vec<u8>,
-    data: Vec<u8>,
-}
-
-impl From<FuzzCompiledInstruction> for CompiledInstruction {
-    fn from(fuzz: FuzzCompiledInstruction) -> Self {
-        Self {
-            program_id_index: fuzz.program_id_index,
-            accounts: fuzz.accounts,
-            data: fuzz.data,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzLegacyMessageInner {
-    header: FuzzMessageHeader,
-    account_keys: Vec<[u8; PUBKEY_BYTES]>,
-    recent_blockhash: [u8; HASH_BYTES],
-    instructions: Vec<FuzzCompiledInstruction>,
-}
-
-impl From<FuzzLegacyMessageInner> for legacy::Message {
-    fn from(fuzz: FuzzLegacyMessageInner) -> Self {
-        Self {
-            header: fuzz.header.into(),
-            account_keys: fuzz
-                .account_keys
-                .into_iter()
-                .map(Pubkey::new_from_array)
-                .collect(),
-            recent_blockhash: Hash::new_from_array(fuzz.recent_blockhash),
-            instructions: fuzz.instructions.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Arbitrary)]
-struct FuzzLegacyMessage {
-    message: FuzzLegacyMessageInner,
-    is_writable_account_cache: Vec<bool>,
-}
-
-impl From<FuzzLegacyMessage> for LegacyMessage<'static> {
-    fn from(fuzz: FuzzLegacyMessage) -> Self {
-        Self {
-            message: Cow::Owned(fuzz.message.into()),
-            is_writable_account_cache: fuzz.is_writable_account_cache,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzLoadedMessageInner {
-    header: FuzzMessageHeader,
-    account_keys: Vec<[u8; PUBKEY_BYTES]>,
-    recent_blockhash: [u8; HASH_BYTES],
-    instructions: Vec<FuzzCompiledInstruction>,
-    address_table_lookups: Vec<FuzzMessageAddressTableLookup>,
-}
-
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzMessageAddressTableLookup {
-    account_key: [u8; PUBKEY_BYTES],
-    writable_indexes: Vec<u8>,
-    readonly_indexes: Vec<u8>,
-}
-
-impl From<FuzzMessageAddressTableLookup> for v0::MessageAddressTableLookup {
-    fn from(fuzz: FuzzMessageAddressTableLookup) -> Self {
-        Self {
-            account_key: Pubkey::new_from_array(fuzz.account_key),
-            writable_indexes: fuzz.writable_indexes,
-            readonly_indexes: fuzz.readonly_indexes,
-        }
-    }
-}
-
-impl From<FuzzLoadedMessageInner> for v0::Message {
-    fn from(fuzz: FuzzLoadedMessageInner) -> Self {
-        Self {
-            header: fuzz.header.into(),
-            account_keys: fuzz
-                .account_keys
-                .into_iter()
-                .map(Pubkey::new_from_array)
-                .collect(),
-            recent_blockhash: Hash::new_from_array(fuzz.recent_blockhash),
-            instructions: fuzz.instructions.into_iter().map(Into::into).collect(),
-            address_table_lookups: fuzz
-                .address_table_lookups
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Arbitrary)]
-struct FuzzLoadedAddresses {
-    writable: Vec<[u8; PUBKEY_BYTES]>,
-    readonly: Vec<[u8; PUBKEY_BYTES]>,
-}
-
-impl From<FuzzLoadedAddresses> for v0::LoadedAddresses {
-    fn from(fuzz: FuzzLoadedAddresses) -> Self {
-        Self {
-            writable: fuzz
-                .writable
-                .into_iter()
-                .map(Pubkey::new_from_array)
-                .collect(),
-            readonly: fuzz
-                .readonly
-                .into_iter()
-                .map(Pubkey::new_from_array)
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Arbitrary)]
-struct FuzzLoadedMessage {
-    message: FuzzLoadedMessageInner,
-    loaded_addresses: FuzzLoadedAddresses,
-    is_writable_account_cache: Vec<bool>,
-}
-
-impl From<FuzzLoadedMessage> for v0::LoadedMessage<'static> {
-    fn from(fuzz: FuzzLoadedMessage) -> v0::LoadedMessage<'static> {
-        Self {
-            message: Cow::Owned(fuzz.message.into()),
-            loaded_addresses: Cow::Owned(fuzz.loaded_addresses.into()),
-            is_writable_account_cache: fuzz.is_writable_account_cache,
-        }
-    }
-}
-
-#[derive(Debug, Arbitrary)]
-enum FuzzSanitizedMessage {
-    Legacy(FuzzLegacyMessage),
-    V0(FuzzLoadedMessage),
-}
-
-impl From<FuzzSanitizedMessage> for VersionedMessage {
-    fn from(fuzz: FuzzSanitizedMessage) -> Self {
-        match fuzz {
-            FuzzSanitizedMessage::Legacy(legacy) => Self::Legacy(legacy.message.into()),
-            FuzzSanitizedMessage::V0(v0) => Self::V0(v0.message.into()),
-        }
-    }
-}
+use message::*;
 
 #[derive(Debug, Arbitrary)]
 enum FuzzInstructionError {
@@ -487,6 +315,7 @@ enum FuzzRewardType {
     Rent,
     Staking,
     Voting,
+    DeactivatedStake,
 }
 
 impl From<FuzzRewardType> for RewardType {
@@ -496,6 +325,7 @@ impl From<FuzzRewardType> for RewardType {
             FuzzRewardType::Rent => RewardType::Rent,
             FuzzRewardType::Staking => RewardType::Staking,
             FuzzRewardType::Voting => RewardType::Voting,
+            FuzzRewardType::DeactivatedStake => RewardType::DeactivatedStake,
         }
     }
 }

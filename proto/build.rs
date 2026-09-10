@@ -13,7 +13,14 @@ fn generate_transport() -> anyhow::Result<()> {
     tonic_prost_build::configure()
         .build_client(false)
         .build_server(false)
-        .compile_protos(&["proto/richat.proto"], &["proto"])?;
+        // Yellowstone types are provided by `yellowstone-grpc-proto` crate,
+        // vendored `.proto` files are used only to resolve imports.
+        .extern_path(".geyser", "::yellowstone_grpc_proto::geyser")
+        .extern_path(
+            ".solana.storage.ConfirmedBlock",
+            "::yellowstone_grpc_proto::solana::storage::confirmed_block",
+        )
+        .compile_protos(&["proto/richat.proto"], &["proto", "proto/yellowstone"])?;
 
     Ok(())
 }

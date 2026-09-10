@@ -1,14 +1,14 @@
 use {
-    crate::stream::handle_stream,
+    crate::stream::{StreamUpdate, handle_stream},
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
-        SlotStatus as GeyserSlotStatus,
+        ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaContactInfoV0_0_1,
+        ReplicaDeshredTransactionInfoV2, ReplicaDeshredUpdateParentInfo, ReplicaEntryInfoV2,
+        ReplicaEntryUpdateParentInfo, ReplicaTransactionInfoV3, SlotStatus as GeyserSlotStatus,
     },
     anyhow::Context,
     clap::{Args, Subcommand},
     futures::stream::{BoxStream, StreamExt, TryStreamExt},
     indicatif::MultiProgress,
-    prost::Message as _,
     richat_client::{
         error::ReceiveError,
         grpc::GrpcClient,
@@ -18,16 +18,21 @@ use {
     richat_proto::{
         convert_from,
         geyser::{
-            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateSlot,
-            SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateDeshredTransaction,
+            SubscribeUpdateSlot, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
         },
-        richat::{GrpcSubscribeRequest, RichatFilter},
+        richat::{
+            GrpcSubscribeRequest, RichatFilter, SubscribeUpdateRichat,
+            subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
+        },
     },
     richat_shared::transports::{grpc::ConfigGrpcServer, quic::ConfigQuicServer},
     solana_clock::Slot,
-    solana_message_v3::{LegacyMessage, Message, SanitizedMessage},
+    solana_entry::block_component::VersionedBlockFooter,
+    solana_hash::Hash,
+    solana_message::{LegacyMessage, Message, SanitizedMessage},
+    solana_transaction::sanitized::SanitizedTransaction,
     solana_transaction_status::TransactionWithStatusMeta,
-    solana_transaction_v3::sanitized::SanitizedTransaction,
     std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration},
     tonic::service::Interceptor,
     tracing::info,
@@ -51,6 +56,22 @@ pub struct ArgsAppStreamRichat {
     /// Disable streaming entries
     #[clap(long)]
     disable_entries: bool,
+
+    /// Enable streaming deshred transactions (should be enabled in the plugin config)
+    #[clap(long)]
+    enable_deshred_transactions: bool,
+
+    /// Enable streaming gossip contact info (should be enabled in the plugin config)
+    #[clap(long)]
+    enable_contact_info: bool,
+
+    /// Enable streaming Alpenglow block footers (should be enabled in the plugin config)
+    #[clap(long)]
+    enable_block_footers: bool,
+
+    /// Enable streaming Alpenglow entry update parents
+    #[clap(long)]
+    enable_entry_update_parents: bool,
 
     /// Subscribe on stream from slot
     #[clap(long)]
@@ -78,6 +99,10 @@ impl ArgsAppStreamRichat {
             disable_accounts: self.disable_accounts,
             disable_transactions: self.disable_transactions,
             disable_entries: self.disable_entries,
+            enable_deshred_transactions: self.enable_deshred_transactions,
+            enable_contact_info: self.enable_contact_info,
+            enable_block_footers: self.enable_block_footers,
+            enable_entry_update_parents: self.enable_entry_update_parents,
         };
         let x_token = self.x_token.map(|xt| xt.into_bytes());
         match self.action {
@@ -102,7 +127,7 @@ impl ArgsAppStreamRichat {
             .and_then(move |vec| {
                 let pb_multi_stream = Arc::clone(&pb_multi_stream);
                 async move {
-                    let msg = SubscribeUpdate::decode(vec.as_slice())?;
+                    let msg = StreamUpdate::decode(vec.as_slice())?;
                     if verify {
                         match convert_prost_to_raw(&msg) {
                             Ok(Some(vec_raw)) if vec != vec_raw => pb_multi_stream.println(
@@ -337,7 +362,14 @@ impl ArgsAppStreamGrpc {
     }
 }
 
-fn convert_prost_to_raw(msg: &SubscribeUpdate) -> anyhow::Result<Option<Vec<u8>>> {
+fn convert_prost_to_raw(msg: &StreamUpdate) -> anyhow::Result<Option<Vec<u8>>> {
+    match msg {
+        StreamUpdate::Geyser(msg) => convert_prost_to_raw_geyser(msg),
+        StreamUpdate::Richat(msg) => convert_prost_to_raw_richat(msg),
+    }
+}
+
+fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<Vec<u8>>> {
     let Some(created_at) = msg.created_at else {
         return Ok(None);
     };
@@ -466,6 +498,139 @@ fn convert_prost_to_raw(msg: &SubscribeUpdate) -> anyhow::Result<Option<Vec<u8>>
                     block_height: meta.block_height.map(|b| b.block_height),
                     executed_transaction_count: meta.executed_transaction_count,
                     entry_count: meta.entries_count,
+                },
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn convert_prost_to_raw_richat(msg: &SubscribeUpdateRichat) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(created_at) = msg.created_at else {
+        return Ok(None);
+    };
+
+    let hash = |hash: &[u8]| {
+        <[u8; 32]>::try_from(hash)
+            .map(Hash::new_from_array)
+            .context("invalid hash")
+    };
+    let socket_addr = |addr: &Option<String>| {
+        addr.as_deref()
+            .map(|addr| addr.parse::<SocketAddr>())
+            .transpose()
+            .context("invalid socket addr")
+    };
+
+    Ok(Some(match &msg.update_oneof {
+        Some(UpdateOneofRichat::DeshredTransaction(SubscribeUpdateDeshredTransaction {
+            transaction: Some(tx),
+            slot,
+        })) => {
+            let transaction = convert_from::create_tx_versioned(
+                tx.transaction
+                    .clone()
+                    .ok_or(anyhow::anyhow!("no transaction"))?,
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+            let loaded_addresses = if tx.loaded_writable_addresses.is_empty()
+                && tx.loaded_readonly_addresses.is_empty()
+            {
+                None
+            } else {
+                Some(
+                    convert_from::create_loaded_addresses(
+                        tx.loaded_writable_addresses.clone(),
+                        tx.loaded_readonly_addresses.clone(),
+                    )
+                    .map_err(|error| anyhow::anyhow!(error))?,
+                )
+            };
+            let signature = tx
+                .signature
+                .as_slice()
+                .try_into()
+                .context("failed to create signature")?;
+
+            let msg = ProtobufMessage::DeshredTransaction {
+                slot: *slot,
+                transaction: &ReplicaDeshredTransactionInfoV2 {
+                    signature: &signature,
+                    is_vote: tx.is_vote,
+                    transaction: &transaction,
+                    loaded_addresses: loaded_addresses.as_ref(),
+                    completed_data_set_starting_shred_index: tx
+                        .completed_data_set_starting_shred_index,
+                    completed_data_set_ending_shred_index_exclusive: tx
+                        .completed_data_set_ending_shred_index_exclusive,
+                },
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        Some(UpdateOneofRichat::ContactInfo(info)) => {
+            let msg = ProtobufMessage::ContactInfo {
+                info: &ReplicaContactInfoV0_0_1 {
+                    pubkey: &info.pubkey,
+                    wallclock: info.wallclock,
+                    outset: info.outset,
+                    shred_version: info.shred_version.try_into()?,
+                    version_major: info.version_major.try_into()?,
+                    version_minor: info.version_minor.try_into()?,
+                    version_patch: info.version_patch.try_into()?,
+                    version_commit: info.version_commit,
+                    version_feature_set: info.version_feature_set,
+                    version_client_id: info.version_client_id.try_into()?,
+                    gossip: socket_addr(&info.gossip)?,
+                    tpu_quic: socket_addr(&info.tpu_quic)?,
+                    tpu_forwards_quic: socket_addr(&info.tpu_forwards_quic)?,
+                    tpu_vote_udp: socket_addr(&info.tpu_vote_udp)?,
+                    tpu_vote_quic: socket_addr(&info.tpu_vote_quic)?,
+                    tvu_udp: socket_addr(&info.tvu_udp)?,
+                    tvu_quic: socket_addr(&info.tvu_quic)?,
+                    serve_repair_udp: socket_addr(&info.serve_repair_udp)?,
+                    serve_repair_quic: socket_addr(&info.serve_repair_quic)?,
+                    rpc: socket_addr(&info.rpc)?,
+                    rpc_pubsub: socket_addr(&info.rpc_pubsub)?,
+                    alpenglow: socket_addr(&info.alpenglow)?,
+                },
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        Some(UpdateOneofRichat::ContactInfoRemoved(info)) => {
+            let msg = ProtobufMessage::ContactInfoRemoved {
+                pubkey: &info.pubkey,
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        Some(UpdateOneofRichat::BlockFooter(footer)) => {
+            let block_footer: VersionedBlockFooter =
+                wincode::deserialize(&footer.footer).context("failed to decode block footer")?;
+            let msg = ProtobufMessage::BlockFooter {
+                slot: footer.slot,
+                bank_id: footer.bank_id,
+                block_footer: &block_footer,
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        Some(UpdateOneofRichat::EntryUpdateParent(info)) => {
+            let msg = ProtobufMessage::EntryUpdateParent {
+                info: &ReplicaEntryUpdateParentInfo {
+                    slot: info.slot,
+                    cleared_bank_id: info.cleared_bank_id,
+                    parent_slot: info.parent_slot,
+                    parent_block_id: &hash(&info.parent_block_id)?,
+                },
+            };
+            msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
+        }
+        Some(UpdateOneofRichat::DeshredUpdateParent(info)) => {
+            let msg = ProtobufMessage::DeshredUpdateParent {
+                info: &ReplicaDeshredUpdateParentInfo {
+                    slot: info.slot,
+                    update_parent_fec_set_index: info.update_parent_fec_set_index,
+                    parent_slot: info.parent_slot,
+                    parent_block_id: &hash(&info.parent_block_id)?,
                 },
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)

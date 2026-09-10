@@ -17,15 +17,13 @@ use {
         ThreadPoolBuilder,
         iter::{IntoParallelIterator, ParallelIterator},
     },
-    richat_filter::message::{MessageAccount, MessageSlot, MessageTransaction},
+    richat_filter::message::{MessageSlot, MessageTransaction},
     richat_proto::{convert_from, geyser::SlotStatus},
     richat_shared::five8::{pubkey_encode, signature_encode},
     solana_account_decoder::encode_ui_account,
-    solana_account_v3::ReadableAccount as StatusReadableAccount,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
     solana_nohash_hasher::IntMap,
-    solana_pubkey::Pubkey,
     solana_rpc_client_api::response::{
         ProcessedSignatureResult, RpcKeyedAccount, RpcLogsResponse, RpcSignatureResult, SlotInfo,
         SlotTransactionStats, SlotUpdate,
@@ -40,30 +38,6 @@ use {
     },
     tokio::sync::oneshot,
 };
-
-struct UiReadableAccount<'a>(&'a MessageAccount);
-
-impl StatusReadableAccount for UiReadableAccount<'_> {
-    fn lamports(&self) -> u64 {
-        solana_account::ReadableAccount::lamports(self.0)
-    }
-
-    fn data(&self) -> &[u8] {
-        solana_account::ReadableAccount::data(self.0)
-    }
-
-    fn owner(&self) -> &Pubkey {
-        solana_account::ReadableAccount::owner(self.0)
-    }
-
-    fn executable(&self) -> bool {
-        solana_account::ReadableAccount::executable(self.0)
-    }
-
-    fn rent_epoch(&self) -> u64 {
-        solana_account::ReadableAccount::rent_epoch(self.0)
-    }
-}
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -504,7 +478,7 @@ pub fn subscriptions_worker(
                                     message.slot(),
                                     encode_ui_account(
                                         message.pubkey(),
-                                        &UiReadableAccount(message.as_ref()),
+                                        message.as_ref(),
                                         encoding,
                                         None,
                                         data_slice,
@@ -525,7 +499,7 @@ pub fn subscriptions_worker(
                                         pubkey: pubkey_encode(&(*message.pubkey()).to_bytes()), // TODO: use `.as_bytes()` from 2.2
                                         account: encode_ui_account(
                                             message.pubkey(),
-                                            &UiReadableAccount(message.as_ref()),
+                                            message.as_ref(),
                                             encoding,
                                             None,
                                             data_slice,

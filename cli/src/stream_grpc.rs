@@ -1,5 +1,5 @@
 use {
-    crate::stream::handle_stream,
+    crate::stream::{StreamUpdate, handle_stream},
     clap::{Args, Subcommand, ValueEnum},
     futures::{
         future::{BoxFuture, FutureExt},
@@ -505,6 +505,7 @@ impl ActionSubscribe {
                     owner: self.accounts_owner,
                     filters,
                     nonempty_txn_signature: self.accounts_nonempty_txn_signature,
+                    cuckoo_accounts_filter: None,
                 },
             );
         }
@@ -531,6 +532,8 @@ impl ActionSubscribe {
                     account_include: self.transactions_account_include,
                     account_exclude: self.transactions_account_exclude,
                     account_required: self.transactions_account_required,
+                    cuckoo_account_include: None,
+                    token_accounts: None,
                 },
             );
         }
@@ -546,6 +549,8 @@ impl ActionSubscribe {
                     account_include: self.transactions_status_account_include,
                     account_exclude: self.transactions_status_account_exclude,
                     account_required: self.transactions_status_account_required,
+                    cuckoo_account_include: None,
+                    token_accounts: None,
                 },
             );
         }
@@ -564,6 +569,7 @@ impl ActionSubscribe {
                     include_transactions: self.blocks_include_transactions,
                     include_accounts: self.blocks_include_accounts,
                     include_entries: self.blocks_include_entries,
+                    cuckoo_account_include: None,
                 },
             );
         }
@@ -690,7 +696,7 @@ async fn geyser_subscribe(
                         ))
                         .unwrap();
                 }
-                Ok(msg)
+                Ok(StreamUpdate::Geyser(msg))
             }
         })
         .boxed();

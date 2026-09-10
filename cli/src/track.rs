@@ -165,6 +165,7 @@ impl ConfigSourceRichatPluginAgave {
             disable_accounts: !accounts_enabled,
             disable_transactions: !transactions_enabled,
             disable_entries: false,
+            ..RichatFilter::default()
         });
 
         let stream = match self {
@@ -215,6 +216,7 @@ impl ConfigYellowstoneGrpc {
                     owner: vec![],
                     filters: vec![],
                     nonempty_txn_signature: None,
+                    cuckoo_accounts_filter: None,
                 },
             );
         }
@@ -230,6 +232,8 @@ impl ConfigYellowstoneGrpc {
                     account_include: vec![],
                     account_exclude: vec![],
                     account_required: vec![],
+                    cuckoo_account_include: None,
+                    token_accounts: None,
                 },
             );
         }

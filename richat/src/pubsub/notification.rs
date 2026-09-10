@@ -10,16 +10,18 @@ use {
     richat_shared::five8::signature_encode,
     serde::Serialize,
     solana_clock::Slot,
-    solana_message_v3::{VersionedMessage, v0::LoadedMessage},
+    solana_message::{VersionedMessage, v0::LoadedMessage},
     solana_rpc_client_api::response::{Response as RpcResponse, RpcResponseContext},
+    solana_transaction::versioned::TransactionVersion,
     solana_transaction_status::{
         BlockEncodingOptions, EncodeError, EncodedTransaction, EncodedTransactionWithStatusMeta,
         TransactionDetails, TransactionStatusMeta, UiAccountsList, UiConfirmedBlock,
         UiTransactionEncoding, UiTransactionStatusMeta, VersionedTransactionWithStatusMeta,
         option_serializer::OptionSerializer,
-        parse_accounts::{parse_legacy_message_accounts, parse_v0_message_accounts},
+        parse_accounts::{
+            parse_legacy_message_accounts, parse_v0_message_accounts, parse_v1_message_accounts,
+        },
     },
-    solana_transaction_v3::versioned::TransactionVersion,
     std::{
         collections::VecDeque,
         sync::{Arc, Weak},
@@ -286,6 +288,7 @@ impl RpcTransactionUpdate {
                 );
                 parse_v0_message_accounts(&loaded_message)
             }
+            VersionedMessage::V1(message) => parse_v1_message_accounts(message),
         };
 
         Ok(EncodedTransactionWithStatusMeta {

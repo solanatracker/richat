@@ -15,6 +15,13 @@
     "max_messages": "2_097_152",
     "max_bytes": "16GiB"
   },
+  // optional Geyser notifications (Richat-only messages), all disabled by default
+  "notifications": {
+    "deshred_transactions": false, // transactions reconstructed from shreds (agave 4.1+)
+    "deshred_transactions_alt_resolution": false, // resolve address lookup tables for deshred transactions
+    "contact_info": false, // gossip contact info (agave 4.2+)
+    "block_footers": false // Alpenglow block footers (agave 4.3+)
+  },
   // by default gRPC is disabled
   // "grpc": {
   //   "endpoint": "127.0.0.1:10100",

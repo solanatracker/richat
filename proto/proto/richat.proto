@@ -1,11 +1,24 @@
 syntax = "proto3";
 
+import "google/protobuf/timestamp.proto";
+// Vendored copy of Yellowstone gRPC proto (see `yellowstone/` directory), types are mapped
+// to `yellowstone_grpc_proto` crate with `extern_path` in `build.rs`.
+import "yellowstone/geyser.proto";
+
 package richat;
 
 message RichatFilter {
   bool disable_accounts = 1;
   bool disable_transactions = 2;
   bool disable_entries = 3;
+
+  // Richat-only streams (see `SubscribeUpdateRichat`) are disabled by default.
+  // Besides enabling them in the filter, the plugin should also have the
+  // corresponding notifications enabled in its config.
+  bool enable_deshred_transactions = 4; // deshred transactions + deshred update parents
+  bool enable_contact_info = 5; // contact info + contact info removed
+  bool enable_block_footers = 6;
+  bool enable_entry_update_parents = 7;
 }
 
 message GrpcSubscribeRequest {
@@ -53,4 +66,51 @@ message SubscribeAccountsRequest {
   string filter = 3;
   repeated bytes add = 4;
   repeated bytes remove = 5;
+}
+
+// Richat-only updates, encoded into the same stream as Yellowstone `SubscribeUpdate`.
+//
+// Tags `1..11` belong to Yellowstone `SubscribeUpdate` (`created_at` shares tag `11`),
+// Richat-only updates use tags `100+`. Decoding the bytes as Yellowstone
+// `SubscribeUpdate` skips unknown fields and yields `update_oneof = None`, in this
+// case the message should be decoded as `SubscribeUpdateRichat`.
+message SubscribeUpdateRichat {
+  oneof update_oneof {
+    geyser.SubscribeUpdateDeshredTransaction deshred_transaction = 100;
+    geyser.SubscribeUpdateContactInfoNode contact_info = 101;
+    geyser.SubscribeUpdateContactInfoRemoved contact_info_removed = 102;
+    SubscribeUpdateBlockFooter block_footer = 103;
+    SubscribeUpdateEntryUpdateParent entry_update_parent = 104;
+    SubscribeUpdateDeshredUpdateParent deshred_update_parent = 105;
+  }
+  google.protobuf.Timestamp created_at = 11;
+}
+
+// Alpenglow block footer, delivered in order with entries of the slot.
+message SubscribeUpdateBlockFooter {
+  uint64 slot = 1;
+  uint64 bank_id = 2;
+  uint32 version = 3; // `VersionedBlockFooter` version
+  bytes bank_hash = 4;
+  uint64 block_producer_time_nanos = 5;
+  bytes block_user_agent = 6;
+  bytes footer = 7; // wincode-serialized `VersionedBlockFooter` (includes certificates)
+}
+
+// Alpenglow UpdateParent marker processed during replay: bank `cleared_bank_id`
+// of slot `slot` was cleared, the replacement bank is reported with `SlotStatus::CreatedBank`.
+message SubscribeUpdateEntryUpdateParent {
+  uint64 slot = 1;
+  uint64 cleared_bank_id = 2;
+  uint64 parent_slot = 3;
+  bytes parent_block_id = 4;
+}
+
+// Alpenglow UpdateParent marker observed in the deshred stream, sent before deshred
+// transactions from the completed data set beginning at the UpdateParent FEC-set boundary.
+message SubscribeUpdateDeshredUpdateParent {
+  uint64 slot = 1;
+  uint32 update_parent_fec_set_index = 2;
+  uint64 parent_slot = 3;
+  bytes parent_block_id = 4;
 }

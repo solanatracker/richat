@@ -1,32 +1,44 @@
 pub mod fixtures {
     use {
         agave_geyser_plugin_interface::geyser_plugin_interface::{
-            ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
-            SlotStatus as GeyserSlotStatus,
+            ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaContactInfoV0_0_1,
+            ReplicaDeshredTransactionInfoV2, ReplicaDeshredUpdateParentInfo, ReplicaEntryInfoV2,
+            ReplicaEntryUpdateParentInfo, ReplicaTransactionInfoV3, SlotStatus as GeyserSlotStatus,
         },
-        prost_011::Message,
+        prost::Message,
         richat_proto::{
             convert_to,
             geyser::{
                 SlotStatus, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
-                SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
+                SubscribeUpdateBlockMeta, SubscribeUpdateContactInfoNode,
+                SubscribeUpdateContactInfoRemoved, SubscribeUpdateDeshredTransaction,
+                SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateEntry, SubscribeUpdateSlot,
                 SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
             },
+            richat::{
+                SubscribeUpdateBlockFooter, SubscribeUpdateDeshredUpdateParent,
+                SubscribeUpdateEntryUpdateParent,
+            },
         },
-        solana_clock::Slot,
+        solana_clock::{BankId, Slot},
+        solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter},
         solana_hash::{HASH_BYTES, Hash},
-        solana_message_v3::{SimpleAddressLoader, v0::LoadedAddresses},
+        solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
         solana_pubkey::Pubkey,
         solana_signature::Signature,
         solana_storage_proto::convert::generated,
-        solana_transaction_status::{
-            ConfirmedBlock, RewardsAndNumPartitions, TransactionStatusMeta,
-        },
-        solana_transaction_v3::{
+        solana_transaction::{
             sanitized::{MessageHash, SanitizedTransaction},
             versioned::VersionedTransaction,
         },
-        std::{collections::HashSet, fs},
+        solana_transaction_status::{
+            ConfirmedBlock, RewardsAndNumPartitions, TransactionStatusMeta,
+        },
+        std::{
+            collections::HashSet,
+            fs,
+            net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+        },
     };
 
     pub fn load_predefined_blocks() -> Vec<(Slot, ConfirmedBlock)> {
@@ -393,9 +405,7 @@ pub mod fixtures {
                 transaction: Some(SubscribeUpdateTransactionInfo {
                     signature: self.signature.as_ref().to_vec(),
                     is_vote: self.is_vote,
-                    transaction: Some(convert_to::create_status_transaction(
-                        &self.versioned_transaction,
-                    )),
+                    transaction: Some(convert_to::create_transaction(&self.versioned_transaction)),
                     meta: Some(convert_to::create_transaction_meta(
                         &self.transaction_status_meta,
                     )),
@@ -456,5 +466,390 @@ pub mod fixtures {
                 transactions
             })
             .collect::<Vec<_>>()
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GeneratedDeshredTransaction {
+        pub slot: Slot,
+        pub signature: Signature,
+        pub is_vote: bool,
+        pub versioned_transaction: VersionedTransaction,
+        pub loaded_addresses: Option<LoadedAddresses>,
+        pub completed_data_set_starting_shred_index: u32,
+        pub completed_data_set_ending_shred_index_exclusive: u32,
+    }
+
+    impl GeneratedDeshredTransaction {
+        pub const fn to_replica(&self) -> (Slot, ReplicaDeshredTransactionInfoV2<'_>) {
+            let replica = ReplicaDeshredTransactionInfoV2 {
+                signature: &self.signature,
+                is_vote: self.is_vote,
+                transaction: &self.versioned_transaction,
+                loaded_addresses: self.loaded_addresses.as_ref(),
+                completed_data_set_starting_shred_index: self
+                    .completed_data_set_starting_shred_index,
+                completed_data_set_ending_shred_index_exclusive: self
+                    .completed_data_set_ending_shred_index_exclusive,
+            };
+            (self.slot, replica)
+        }
+
+        pub fn to_prost(&self) -> SubscribeUpdateDeshredTransaction {
+            SubscribeUpdateDeshredTransaction {
+                transaction: Some(SubscribeUpdateDeshredTransactionInfo {
+                    signature: self.signature.as_ref().to_vec(),
+                    is_vote: self.is_vote,
+                    transaction: Some(convert_to::create_transaction(&self.versioned_transaction)),
+                    loaded_writable_addresses: self
+                        .loaded_addresses
+                        .as_ref()
+                        .map(|addresses| convert_to::create_pubkeys(&addresses.writable))
+                        .unwrap_or_default(),
+                    loaded_readonly_addresses: self
+                        .loaded_addresses
+                        .as_ref()
+                        .map(|addresses| convert_to::create_pubkeys(&addresses.readonly))
+                        .unwrap_or_default(),
+                    completed_data_set_starting_shred_index: self
+                        .completed_data_set_starting_shred_index,
+                    completed_data_set_ending_shred_index_exclusive: self
+                        .completed_data_set_ending_shred_index_exclusive,
+                }),
+                slot: self.slot,
+            }
+        }
+    }
+
+    pub fn generate_deshred_transactions() -> Vec<GeneratedDeshredTransaction> {
+        generate_transactions()
+            .into_iter()
+            .enumerate()
+            .flat_map(|(index, tx)| {
+                let loaded_addresses = LoadedAddresses {
+                    writable: tx.transaction_status_meta.loaded_addresses.writable.clone(),
+                    readonly: tx.transaction_status_meta.loaded_addresses.readonly.clone(),
+                };
+                let base = GeneratedDeshredTransaction {
+                    slot: tx.slot,
+                    signature: tx.signature,
+                    is_vote: tx.is_vote,
+                    versioned_transaction: tx.versioned_transaction,
+                    loaded_addresses: None,
+                    completed_data_set_starting_shred_index: 0,
+                    completed_data_set_ending_shred_index_exclusive: 0,
+                };
+                let mut with_addresses = base.clone();
+                with_addresses.loaded_addresses = Some(loaded_addresses);
+                with_addresses.completed_data_set_starting_shred_index = index as u32;
+                with_addresses.completed_data_set_ending_shred_index_exclusive = index as u32 + 3;
+                [base, with_addresses]
+            })
+            .collect()
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GeneratedContactInfo {
+        pub pubkey: Pubkey,
+        pub wallclock: u64,
+        pub outset: u64,
+        pub shred_version: u16,
+        pub version_major: u16,
+        pub version_minor: u16,
+        pub version_patch: u16,
+        pub version_commit: u32,
+        pub version_feature_set: u32,
+        pub version_client_id: u16,
+        pub gossip: Option<SocketAddr>,
+        pub tpu_quic: Option<SocketAddr>,
+        pub tpu_forwards_quic: Option<SocketAddr>,
+        pub tpu_vote_udp: Option<SocketAddr>,
+        pub tpu_vote_quic: Option<SocketAddr>,
+        pub tvu_udp: Option<SocketAddr>,
+        pub tvu_quic: Option<SocketAddr>,
+        pub serve_repair_udp: Option<SocketAddr>,
+        pub serve_repair_quic: Option<SocketAddr>,
+        pub rpc: Option<SocketAddr>,
+        pub rpc_pubsub: Option<SocketAddr>,
+        pub alpenglow: Option<SocketAddr>,
+    }
+
+    impl GeneratedContactInfo {
+        pub const fn to_replica(&self) -> ReplicaContactInfoV0_0_1<'_> {
+            ReplicaContactInfoV0_0_1 {
+                pubkey: self.pubkey.as_array(),
+                wallclock: self.wallclock,
+                outset: self.outset,
+                shred_version: self.shred_version,
+                version_major: self.version_major,
+                version_minor: self.version_minor,
+                version_patch: self.version_patch,
+                version_commit: self.version_commit,
+                version_feature_set: self.version_feature_set,
+                version_client_id: self.version_client_id,
+                gossip: self.gossip,
+                tpu_quic: self.tpu_quic,
+                tpu_forwards_quic: self.tpu_forwards_quic,
+                tpu_vote_udp: self.tpu_vote_udp,
+                tpu_vote_quic: self.tpu_vote_quic,
+                tvu_udp: self.tvu_udp,
+                tvu_quic: self.tvu_quic,
+                serve_repair_udp: self.serve_repair_udp,
+                serve_repair_quic: self.serve_repair_quic,
+                rpc: self.rpc,
+                rpc_pubsub: self.rpc_pubsub,
+                alpenglow: self.alpenglow,
+            }
+        }
+
+        pub fn to_prost(&self) -> SubscribeUpdateContactInfoNode {
+            let addr = |addr: Option<SocketAddr>| addr.map(|addr| addr.to_string());
+            SubscribeUpdateContactInfoNode {
+                pubkey: self.pubkey.to_bytes().to_vec(),
+                wallclock: self.wallclock,
+                outset: self.outset,
+                shred_version: self.shred_version as u32,
+                version_major: self.version_major as u32,
+                version_minor: self.version_minor as u32,
+                version_patch: self.version_patch as u32,
+                version_commit: self.version_commit,
+                version_feature_set: self.version_feature_set,
+                version_client_id: self.version_client_id as u32,
+                gossip: addr(self.gossip),
+                tpu_quic: addr(self.tpu_quic),
+                tpu_forwards_quic: addr(self.tpu_forwards_quic),
+                tpu_vote_udp: addr(self.tpu_vote_udp),
+                tpu_vote_quic: addr(self.tpu_vote_quic),
+                tvu_udp: addr(self.tvu_udp),
+                tvu_quic: addr(self.tvu_quic),
+                serve_repair_udp: addr(self.serve_repair_udp),
+                serve_repair_quic: addr(self.serve_repair_quic),
+                rpc: addr(self.rpc),
+                rpc_pubsub: addr(self.rpc_pubsub),
+                alpenglow: addr(self.alpenglow),
+            }
+        }
+
+        pub fn to_prost_removed(&self) -> SubscribeUpdateContactInfoRemoved {
+            SubscribeUpdateContactInfoRemoved {
+                pubkey: self.pubkey.to_bytes().to_vec(),
+            }
+        }
+    }
+
+    pub fn generate_contact_infos() -> Vec<GeneratedContactInfo> {
+        let v4 = |port: u16| {
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+                port,
+            ))
+        };
+        let v6 = |port: u16| {
+            Some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(
+                    0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                )),
+                port,
+            ))
+        };
+
+        vec![
+            GeneratedContactInfo {
+                pubkey: Pubkey::new_unique(),
+                wallclock: 1_757_500_000_000,
+                outset: 1_757_400_000_000_000,
+                shred_version: 50093,
+                version_major: 4,
+                version_minor: 3,
+                version_patch: 0,
+                version_commit: 0xdead_beef,
+                version_feature_set: 0x1234_5678,
+                version_client_id: 3,
+                gossip: v4(8001),
+                tpu_quic: v4(8009),
+                tpu_forwards_quic: v4(8010),
+                tpu_vote_udp: v4(8005),
+                tpu_vote_quic: v4(8006),
+                tvu_udp: v4(8002),
+                tvu_quic: v4(8003),
+                serve_repair_udp: v4(8008),
+                serve_repair_quic: v4(8007),
+                rpc: v4(8899),
+                rpc_pubsub: v4(8900),
+                alpenglow: v4(8011),
+            },
+            GeneratedContactInfo {
+                pubkey: Pubkey::new_unique(),
+                wallclock: u64::MAX,
+                outset: 0,
+                shred_version: u16::MAX,
+                version_major: u16::MAX,
+                version_minor: 0,
+                version_patch: u16::MAX,
+                version_commit: u32::MAX,
+                version_feature_set: 0,
+                version_client_id: u16::MAX,
+                gossip: v6(u16::MAX),
+                tpu_quic: None,
+                tpu_forwards_quic: v6(1),
+                tpu_vote_udp: None,
+                tpu_vote_quic: v6(0),
+                tvu_udp: None,
+                tvu_quic: None,
+                serve_repair_udp: None,
+                serve_repair_quic: None,
+                rpc: Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8899)),
+                // longest possible `SocketAddr` display: full IPv6 + max scope id + max port
+                rpc_pubsub: Some(SocketAddr::V6(SocketAddrV6::new(
+                    Ipv6Addr::new(
+                        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                    ),
+                    u16::MAX,
+                    0,
+                    u32::MAX,
+                ))),
+                alpenglow: None,
+            },
+            GeneratedContactInfo {
+                pubkey: Pubkey::default(),
+                wallclock: 0,
+                outset: 0,
+                shred_version: 0,
+                version_major: 0,
+                version_minor: 0,
+                version_patch: 0,
+                version_commit: 0,
+                version_feature_set: 0,
+                version_client_id: 0,
+                gossip: None,
+                tpu_quic: None,
+                tpu_forwards_quic: None,
+                tpu_vote_udp: None,
+                tpu_vote_quic: None,
+                tvu_udp: None,
+                tvu_quic: None,
+                serve_repair_udp: None,
+                serve_repair_quic: None,
+                rpc: None,
+                rpc_pubsub: None,
+                alpenglow: None,
+            },
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GeneratedBlockFooter {
+        pub slot: Slot,
+        pub bank_id: BankId,
+        pub block_footer: VersionedBlockFooter,
+    }
+
+    impl GeneratedBlockFooter {
+        pub fn to_prost(&self) -> SubscribeUpdateBlockFooter {
+            let VersionedBlockFooter::V1(footer) = &self.block_footer;
+            SubscribeUpdateBlockFooter {
+                slot: self.slot,
+                bank_id: self.bank_id,
+                version: 1,
+                bank_hash: footer.bank_hash.to_bytes().to_vec(),
+                block_producer_time_nanos: footer.block_producer_time_nanos,
+                block_user_agent: footer.block_user_agent.clone(),
+                footer: wincode::serialize(&self.block_footer).expect("failed to serialize"),
+            }
+        }
+    }
+
+    pub fn generate_block_footers() -> Vec<GeneratedBlockFooter> {
+        vec![
+            GeneratedBlockFooter {
+                slot: 362_000_001,
+                bank_id: 42,
+                block_footer: VersionedBlockFooter::V1(BlockFooterV1 {
+                    bank_hash: Hash::new_from_array([7; HASH_BYTES]),
+                    block_producer_time_nanos: 1_757_500_000_000_000_000,
+                    block_user_agent: b"agave/4.3.0".to_vec(),
+                    block_final_cert: None,
+                    skip_reward_cert: None,
+                    notar_reward_cert: None,
+                }),
+            },
+            GeneratedBlockFooter {
+                slot: 0,
+                bank_id: 0,
+                block_footer: VersionedBlockFooter::V1(BlockFooterV1 {
+                    bank_hash: Hash::default(),
+                    block_producer_time_nanos: 0,
+                    block_user_agent: vec![],
+                    block_final_cert: None,
+                    skip_reward_cert: None,
+                    notar_reward_cert: None,
+                }),
+            },
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GeneratedUpdateParent {
+        pub slot: Slot,
+        pub cleared_bank_id: BankId,
+        pub update_parent_fec_set_index: u32,
+        pub parent_slot: Slot,
+        pub parent_block_id: Hash,
+    }
+
+    impl GeneratedUpdateParent {
+        pub const fn to_replica_entry(&self) -> ReplicaEntryUpdateParentInfo<'_> {
+            ReplicaEntryUpdateParentInfo {
+                slot: self.slot,
+                cleared_bank_id: self.cleared_bank_id,
+                parent_slot: self.parent_slot,
+                parent_block_id: &self.parent_block_id,
+            }
+        }
+
+        pub const fn to_replica_deshred(&self) -> ReplicaDeshredUpdateParentInfo<'_> {
+            ReplicaDeshredUpdateParentInfo {
+                slot: self.slot,
+                update_parent_fec_set_index: self.update_parent_fec_set_index,
+                parent_slot: self.parent_slot,
+                parent_block_id: &self.parent_block_id,
+            }
+        }
+
+        pub fn to_prost_entry(&self) -> SubscribeUpdateEntryUpdateParent {
+            SubscribeUpdateEntryUpdateParent {
+                slot: self.slot,
+                cleared_bank_id: self.cleared_bank_id,
+                parent_slot: self.parent_slot,
+                parent_block_id: self.parent_block_id.to_bytes().to_vec(),
+            }
+        }
+
+        pub fn to_prost_deshred(&self) -> SubscribeUpdateDeshredUpdateParent {
+            SubscribeUpdateDeshredUpdateParent {
+                slot: self.slot,
+                update_parent_fec_set_index: self.update_parent_fec_set_index,
+                parent_slot: self.parent_slot,
+                parent_block_id: self.parent_block_id.to_bytes().to_vec(),
+            }
+        }
+    }
+
+    pub fn generate_update_parents() -> Vec<GeneratedUpdateParent> {
+        vec![
+            GeneratedUpdateParent {
+                slot: 362_000_002,
+                cleared_bank_id: 43,
+                update_parent_fec_set_index: 96,
+                parent_slot: 362_000_000,
+                parent_block_id: Hash::new_from_array([9; HASH_BYTES]),
+            },
+            GeneratedUpdateParent {
+                slot: 0,
+                cleared_bank_id: 0,
+                update_parent_fec_set_index: 0,
+                parent_slot: 0,
+                parent_block_id: Hash::default(),
+            },
+        ]
     }
 }

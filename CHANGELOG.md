@@ -16,6 +16,38 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Breaking
 
+## 2026-09-10
+
+- richat-cli-v11.0.0
+- richat-client-v10.0.0
+- richat-filter-v10.0.0
+- richat-plugin-agave-v10.0.0
+- richat-proto-v10.0.0
+- richat-v12.0.0
+- richat-shared-v10.0.0
+
+### Fixes
+
+- plugin-agave: encode `commission_bps` in raw `Reward` encoder (was missing, prost and raw outputs differed)
+
+### Features
+
+- proto: support transaction message `V1` (SIMD-0385) with `TransactionConfig` in `convert_to` / `convert_from`
+- plugin-agave: encode transaction message `V1` (SIMD-0385) in raw encoder
+- richat: support transaction message `V1` in pubsub `accounts` encoding
+- proto: support `RewardType::DeactivatedStake`
+- filter: reject unsupported Yellowstone filters (`cuckoo_*`, `token_accounts`) with `FieldNotSupported`
+- proto: Richat-only updates `SubscribeUpdateRichat` (tags `100+` in the `SubscribeUpdate` stream): deshred transactions, gossip contact info (add / remove), Alpenglow block footers and entry / deshred update parents; `RichatFilter` gets `enable_deshred_transactions`, `enable_contact_info`, `enable_block_footers`, `enable_entry_update_parents` (all disabled by default)
+- plugin-agave: implement `notify_deshred_transaction`, `notify_deshred_update_parent`, `notify_entry_update_parent`, `notify_block_footer`, `notify_contact_info`, `notify_contact_info_removed` (agave 4.1–4.3), opt-in via new `notifications` config section (`deshred_transactions`, `deshred_transactions_alt_resolution`, `contact_info`, `block_footers`)
+- filter: Richat-only updates are reported as `MessageParseError::InvalidUpdateMessage("Richat")` and skipped by `richat`
+- cli: `stream richat` flags `--enable-deshred-transactions`, `--enable-contact-info`, `--enable-block-footers`, `--enable-entry-update-parents`, prints / verifies Richat-only updates
+
+### Breaking
+
+- richat: upgrade to agave 4.3 (bank-scoped geyser callbacks, solana-message v4, yellowstone-grpc-proto 12.7)
+- proto: remove `create_status_*` helpers, `solana-message-v3` / `solana-transaction-v3` / `solana-account-v3` aliases are no longer needed
+- plugin-agave: `ProtobufMessage::get_slot` returns `Option<Slot>` (contact info messages are not tied to a slot)
+
 ## 2026-05-20
 
 - richat-cli-v10.0.0

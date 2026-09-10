@@ -3,20 +3,26 @@ use {
     futures::stream::{BoxStream, StreamExt},
     indicatif::{MultiProgress, ProgressBar, ProgressStyle},
     prost::Message,
+    prost_types::Timestamp,
     richat_client::error::ReceiveError,
     richat_proto::{
         convert_from,
         geyser::{
             SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-            SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
-            subscribe_update::UpdateOneof,
+            SubscribeUpdateBlockMeta, SubscribeUpdateContactInfoNode,
+            SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateEntry,
+            SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
+        },
+        richat::{
+            SubscribeUpdateBlockFooter, SubscribeUpdateRichat,
+            subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
         },
     },
     serde_json::{Value, json},
     solana_hash::Hash,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    solana_transaction_status::UiTransactionEncoding,
+    solana_transaction_status::{Encodable, UiTransactionEncoding},
     std::{
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
@@ -24,8 +30,36 @@ use {
     tracing::{error, info},
 };
 
+/// Update received from the stream: Yellowstone `SubscribeUpdate` or Richat-only update
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum StreamUpdate {
+    Geyser(SubscribeUpdate),
+    Richat(SubscribeUpdateRichat),
+}
+
+impl StreamUpdate {
+    pub fn decode(data: &[u8]) -> Result<Self, prost::DecodeError> {
+        let msg = SubscribeUpdate::decode(data)?;
+        if msg.update_oneof.is_none() {
+            let richat = SubscribeUpdateRichat::decode(data)?;
+            if richat.update_oneof.is_some() {
+                return Ok(Self::Richat(richat));
+            }
+        }
+        Ok(Self::Geyser(msg))
+    }
+}
+
+fn parse_created_at(created_at: Option<Timestamp>) -> anyhow::Result<SystemTime> {
+    created_at
+        .ok_or(anyhow::anyhow!("no created_at in the message"))?
+        .try_into()
+        .context("failed to parse created_at")
+}
+
 pub async fn handle_stream(
-    stream: BoxStream<'static, Result<SubscribeUpdate, ReceiveError>>,
+    stream: BoxStream<'static, Result<StreamUpdate, ReceiveError>>,
     pb_multi: Arc<MultiProgress>,
     stats: bool,
 ) -> anyhow::Result<()> {
@@ -52,6 +86,15 @@ pub async fn handle_stream(
     let pb_blocks = create_progress_bar(&pb_multi, ProgressBarTpl::Msg("blocks"))?;
     let mut pb_pp_c = 0;
     let pb_pp = create_progress_bar(&pb_multi, ProgressBarTpl::Msg("ping/pong"))?;
+    let mut pb_deshred_txs_c = 0;
+    let pb_deshred_txs =
+        create_progress_bar(&pb_multi, ProgressBarTpl::Msg("deshred transactions"))?;
+    let mut pb_contact_info_c = 0;
+    let pb_contact_info = create_progress_bar(&pb_multi, ProgressBarTpl::Msg("contact info"))?;
+    let mut pb_blocks_ft_c = 0;
+    let pb_blocks_ft = create_progress_bar(&pb_multi, ProgressBarTpl::Msg("blocks footer"))?;
+    let mut pb_update_parents_c = 0;
+    let pb_update_parents = create_progress_bar(&pb_multi, ProgressBarTpl::Msg("update parents"))?;
     let mut pb_total_c = 0;
     let pb_total = create_progress_bar(&pb_multi, ProgressBarTpl::Total)?;
 
@@ -62,6 +105,45 @@ pub async fn handle_stream(
             Err(error) => {
                 error!("error: {error:?}");
                 break;
+            }
+        };
+
+        let msg = match msg {
+            StreamUpdate::Geyser(msg) => msg,
+            StreamUpdate::Richat(msg) => {
+                let encoded_len = msg.encoded_len() as u64;
+                let created_at = parse_created_at(msg.created_at)?;
+                let Some(update) = msg.update_oneof else {
+                    error!("update not found in the message");
+                    break;
+                };
+
+                if stats {
+                    let (pb_c, pb) = match &update {
+                        UpdateOneofRichat::DeshredTransaction(_) => {
+                            (&mut pb_deshred_txs_c, &pb_deshred_txs)
+                        }
+                        UpdateOneofRichat::ContactInfo(_)
+                        | UpdateOneofRichat::ContactInfoRemoved(_) => {
+                            (&mut pb_contact_info_c, &pb_contact_info)
+                        }
+                        UpdateOneofRichat::BlockFooter(_) => (&mut pb_blocks_ft_c, &pb_blocks_ft),
+                        UpdateOneofRichat::EntryUpdateParent(_)
+                        | UpdateOneofRichat::DeshredUpdateParent(_) => {
+                            (&mut pb_update_parents_c, &pb_update_parents)
+                        }
+                    };
+                    *pb_c += 1;
+                    pb.set_message(format_thousands(*pb_c));
+                    pb.inc(encoded_len);
+                    pb_total_c += 1;
+                    pb_total.set_message(format_thousands(pb_total_c));
+                    pb_total.inc(encoded_len);
+                } else {
+                    let (kind, value) = create_pretty_richat(update)?;
+                    print_update(kind, created_at, &[], value);
+                }
+                continue;
             }
         };
 
@@ -121,11 +203,7 @@ pub async fn handle_stream(
         }
 
         let filters = msg.filters;
-        let created_at: SystemTime = msg
-            .created_at
-            .ok_or(anyhow::anyhow!("no created_at in the message"))?
-            .try_into()
-            .context("failed to parse created_at")?;
+        let created_at = parse_created_at(msg.created_at)?;
         match msg.update_oneof {
             Some(UpdateOneof::Account(msg)) => {
                 let account = msg
@@ -313,6 +391,113 @@ fn create_pretty_block(msg: SubscribeUpdateBlock) -> anyhow::Result<Value> {
         "accounts": msg.accounts.into_iter().map(create_pretty_account).collect::<Result<Value, _>>()?,
         "entriesCount": msg.entries_count,
         "entries": msg.entries.into_iter().map(create_pretty_entry).collect::<Result<Value, _>>()?,
+    }))
+}
+
+fn create_pretty_richat(update: UpdateOneofRichat) -> anyhow::Result<(&'static str, Value)> {
+    Ok(match update {
+        UpdateOneofRichat::DeshredTransaction(msg) => {
+            let tx = msg
+                .transaction
+                .ok_or(anyhow::anyhow!("no transaction in the message"))?;
+            let mut value = create_pretty_deshred_transaction(tx)?;
+            value["slot"] = json!(msg.slot);
+            ("deshredTransaction", value)
+        }
+        UpdateOneofRichat::ContactInfo(msg) => ("contactInfo", create_pretty_contact_info(msg)?),
+        UpdateOneofRichat::ContactInfoRemoved(msg) => (
+            "contactInfoRemoved",
+            json!({
+                "pubkey": Pubkey::try_from(msg.pubkey).map_err(|_| anyhow::anyhow!("invalid pubkey"))?.to_string(),
+            }),
+        ),
+        UpdateOneofRichat::BlockFooter(msg) => ("blockFooter", create_pretty_block_footer(msg)?),
+        UpdateOneofRichat::EntryUpdateParent(msg) => (
+            "entryUpdateParent",
+            json!({
+                "slot": msg.slot,
+                "clearedBankId": msg.cleared_bank_id,
+                "parentSlot": msg.parent_slot,
+                "parentBlockId": create_pretty_hash(&msg.parent_block_id, "parent block id")?,
+            }),
+        ),
+        UpdateOneofRichat::DeshredUpdateParent(msg) => (
+            "deshredUpdateParent",
+            json!({
+                "slot": msg.slot,
+                "updateParentFecSetIndex": msg.update_parent_fec_set_index,
+                "parentSlot": msg.parent_slot,
+                "parentBlockId": create_pretty_hash(&msg.parent_block_id, "parent block id")?,
+            }),
+        ),
+    })
+}
+
+fn create_pretty_hash(hash: &[u8], name: &str) -> anyhow::Result<String> {
+    Ok(
+        Hash::new_from_array(
+            <[u8; 32]>::try_from(hash).with_context(|| format!("invalid {name}"))?,
+        )
+        .to_string(),
+    )
+}
+
+fn create_pretty_deshred_transaction(
+    tx: SubscribeUpdateDeshredTransactionInfo,
+) -> anyhow::Result<Value> {
+    let pubkeys = |pubkeys: Vec<Vec<u8>>| {
+        convert_from::create_pubkey_vec(pubkeys)
+            .map_err(|error| anyhow::anyhow!(error))
+            .map(|pubkeys| pubkeys.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    Ok(json!({
+        "signature": Signature::try_from(tx.signature.as_slice()).context("invalid signature")?.to_string(),
+        "isVote": tx.is_vote,
+        "tx": convert_from::create_tx_versioned(tx.transaction.ok_or(anyhow::anyhow!("no transaction"))?)
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("invalid transaction")?
+            .encode(UiTransactionEncoding::Base64),
+        "loadedWritableAddresses": pubkeys(tx.loaded_writable_addresses)?,
+        "loadedReadonlyAddresses": pubkeys(tx.loaded_readonly_addresses)?,
+        "completedDataSetStartingShredIndex": tx.completed_data_set_starting_shred_index,
+        "completedDataSetEndingShredIndexExclusive": tx.completed_data_set_ending_shred_index_exclusive,
+    }))
+}
+
+fn create_pretty_contact_info(msg: SubscribeUpdateContactInfoNode) -> anyhow::Result<Value> {
+    Ok(json!({
+        "pubkey": Pubkey::try_from(msg.pubkey).map_err(|_| anyhow::anyhow!("invalid pubkey"))?.to_string(),
+        "wallclock": msg.wallclock,
+        "outset": msg.outset,
+        "shredVersion": msg.shred_version,
+        "version": format!("{}.{}.{}", msg.version_major, msg.version_minor, msg.version_patch),
+        "versionCommit": msg.version_commit,
+        "versionFeatureSet": msg.version_feature_set,
+        "versionClientId": msg.version_client_id,
+        "gossip": msg.gossip,
+        "tpuQuic": msg.tpu_quic,
+        "tpuForwardsQuic": msg.tpu_forwards_quic,
+        "tpuVoteUdp": msg.tpu_vote_udp,
+        "tpuVoteQuic": msg.tpu_vote_quic,
+        "tvuUdp": msg.tvu_udp,
+        "tvuQuic": msg.tvu_quic,
+        "serveRepairUdp": msg.serve_repair_udp,
+        "serveRepairQuic": msg.serve_repair_quic,
+        "rpc": msg.rpc,
+        "rpcPubsub": msg.rpc_pubsub,
+        "alpenglow": msg.alpenglow,
+    }))
+}
+
+fn create_pretty_block_footer(msg: SubscribeUpdateBlockFooter) -> anyhow::Result<Value> {
+    Ok(json!({
+        "slot": msg.slot,
+        "bankId": msg.bank_id,
+        "version": msg.version,
+        "bankHash": create_pretty_hash(&msg.bank_hash, "bank hash")?,
+        "blockProducerTimeNanos": msg.block_producer_time_nanos,
+        "blockUserAgent": String::from_utf8_lossy(&msg.block_user_agent),
+        "footer": const_hex::encode(msg.footer),
     }))
 }
 

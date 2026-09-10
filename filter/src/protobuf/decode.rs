@@ -73,6 +73,8 @@ pub trait LimitedDecode: Default {
 pub struct SubscribeUpdateLimitedDecode {
     pub update_oneof: Option<UpdateOneofLimitedDecode>,
     pub created_at: Option<Timestamp>,
+    /// Richat-only update (`SubscribeUpdateRichat`) is present, tags `100+`
+    pub richat_update: bool,
 }
 
 impl LimitedDecode for SubscribeUpdateLimitedDecode {
@@ -117,6 +119,15 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
                     error.push(STRUCT_NAME, "created_at");
                     error
                 })
+            }
+            100u32..=105u32 => {
+                self.richat_update = true;
+                encoding::skip_field(
+                    WireType::LengthDelimited,
+                    tag,
+                    buf,
+                    DecodeContext::default(),
+                )
             }
             _ => encoding::skip_field(
                 WireType::LengthDelimited,

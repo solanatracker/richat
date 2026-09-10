@@ -1,5 +1,13 @@
 pub use self::{
-    account::Account, block_meta::BlockMeta, entry::Entry, slot::Slot, transaction::Transaction,
+    account::Account,
+    block_footer::{BlockFooter, BlockFooterView},
+    block_meta::BlockMeta,
+    contact_info::{ContactInfo, ContactInfoRemoved},
+    deshred_transaction::DeshredTransaction,
+    entry::Entry,
+    slot::Slot,
+    transaction::Transaction,
+    update_parent::{DeshredUpdateParent, EntryUpdateParent},
 };
 use {
     prost::{
@@ -14,10 +22,14 @@ use {
 };
 
 mod account;
+mod block_footer;
 mod block_meta;
+mod contact_info;
+mod deshred_transaction;
 mod entry;
 mod slot;
 mod transaction;
+mod update_parent;
 
 const NUM_STRINGS: [&str; 256] = [
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
@@ -43,6 +55,23 @@ const NUM_STRINGS: [&str; 256] = [
 
 const fn u8_to_static_str(num: u8) -> &'static str {
     NUM_STRINGS[num as usize]
+}
+
+const U16_MAX_DIGITS: usize = 5;
+
+/// Format `u16` as decimal string into the provided stack buffer (no allocation).
+fn u16_to_str(mut num: u16, buffer: &mut [u8; U16_MAX_DIGITS]) -> &str {
+    let mut index = U16_MAX_DIGITS;
+    loop {
+        index -= 1;
+        buffer[index] = b'0' + (num % 10) as u8;
+        num /= 10;
+        if num == 0 {
+            break;
+        }
+    }
+    // SAFETY: buffer contains only ASCII digits in `index..`
+    unsafe { std::str::from_utf8_unchecked(&buffer[index..]) }
 }
 
 #[repr(transparent)]
@@ -87,6 +116,10 @@ impl Message for RewardWrapper<'_> {
         if let Some(commission) = self.commission {
             bytes_encode(5, u8_to_static_str(commission).as_ref(), buf);
         }
+        if let Some(commission_bps) = self.commission_bps {
+            let mut buffer = [0u8; U16_MAX_DIGITS];
+            bytes_encode(6, u16_to_str(commission_bps, &mut buffer).as_ref(), buf);
+        }
     }
 
     fn encoded_len(&self) -> usize {
@@ -108,6 +141,9 @@ impl Message for RewardWrapper<'_> {
             0
         } + self.commission.map_or(0, |commission| {
             bytes_encoded_len(5, u8_to_static_str(commission).as_ref())
+        }) + self.commission_bps.map_or(0, |commission_bps| {
+            let mut buffer = [0u8; U16_MAX_DIGITS];
+            bytes_encoded_len(6, u16_to_str(commission_bps, &mut buffer).as_ref())
         })
     }
 
@@ -136,6 +172,7 @@ pub const fn reward_type_as_i32(reward_type: Option<RewardType>) -> i32 {
         Some(RewardType::Rent) => 2,
         Some(RewardType::Staking) => 3,
         Some(RewardType::Voting) => 4,
+        Some(RewardType::DeactivatedStake) => 5,
     }
 }
 

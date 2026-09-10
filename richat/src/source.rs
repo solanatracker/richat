@@ -353,7 +353,9 @@ impl Subscription {
                 let message = match stream.next().await {
                     Some(Ok(data)) => match Message::parse(data.into(), parser) {
                         Ok(message) => Ok((name, message)),
-                        Err(MessageParseError::InvalidUpdateMessage("Ping")) => continue,
+                        Err(MessageParseError::InvalidUpdateMessage("Ping" | "Richat")) => {
+                            continue;
+                        }
                         Err(error) => Err(error.into()),
                     },
                     Some(Err(error)) => {
@@ -383,6 +385,11 @@ impl Subscription {
             disable_accounts,
             disable_transactions: false,
             disable_entries: false,
+            // Richat-only messages are not supported yet
+            enable_deshred_transactions: false,
+            enable_contact_info: false,
+            enable_block_footers: false,
+            enable_entry_update_parents: false,
         })
     }
 

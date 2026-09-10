@@ -15,6 +15,7 @@ pub enum FuzzRewardType {
     Rent = 2,
     Staking = 3,
     Voting = 4,
+    DeactivatedStake = 5,
 }
 
 impl From<FuzzRewardType> for RewardType {
@@ -24,6 +25,7 @@ impl From<FuzzRewardType> for RewardType {
             FuzzRewardType::Rent => RewardType::Rent,
             FuzzRewardType::Staking => RewardType::Staking,
             FuzzRewardType::Voting => RewardType::Voting,
+            FuzzRewardType::DeactivatedStake => RewardType::DeactivatedStake,
         }
     }
 }

@@ -17,6 +17,7 @@ use {
             SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta,
             SubscribeUpdateEntry, SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
         },
+        richat::SubscribeUpdateRichat,
         solana::storage::confirmed_block::{TransactionError, TransactionStatusMeta},
     },
     serde::{Deserialize, Serialize},
@@ -196,142 +197,144 @@ impl MessageParserLimited {
             .created_at
             .ok_or(MessageParseError::FieldNotDefined("created_at"))?;
 
-        Ok(
-            match update
-                .update_oneof
-                .ok_or(MessageParseError::FieldNotDefined("update_oneof"))?
-            {
-                UpdateOneofLimitedDecode::Slot(range) => {
-                    let message = UpdateOneofLimitedDecodeSlot::decode(
-                        &data.as_slice()[range.start..range.end],
-                    )?;
-                    Message::Slot(MessageSlot::Limited {
-                        slot: message.slot,
-                        parent: message.parent,
-                        status: SlotStatus::try_from(message.status)
-                            .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
-                        dead_error: message.dead_error,
-                        created_at,
-                        buffer: data,
-                        range,
+        let Some(update_oneof) = update.update_oneof else {
+            return Err(if update.richat_update {
+                MessageParseError::InvalidUpdateMessage("Richat")
+            } else {
+                MessageParseError::FieldNotDefined("update_oneof")
+            });
+        };
+
+        Ok(match update_oneof {
+            UpdateOneofLimitedDecode::Slot(range) => {
+                let message =
+                    UpdateOneofLimitedDecodeSlot::decode(&data.as_slice()[range.start..range.end])?;
+                Message::Slot(MessageSlot::Limited {
+                    slot: message.slot,
+                    parent: message.parent,
+                    status: SlotStatus::try_from(message.status)
+                        .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
+                    dead_error: message.dead_error,
+                    created_at,
+                    buffer: data,
+                    range,
+                })
+            }
+            UpdateOneofLimitedDecode::Account(range) => {
+                let message = UpdateOneofLimitedDecodeAccount::decode(
+                    &data.as_slice()[range.start..range.end],
+                )?;
+
+                if message.account == usize::MAX {
+                    return Err(MessageParseError::FieldNotDefined("account"));
+                }
+
+                let mut data_range = message.data;
+                data_range.start += range.start;
+                data_range.end += range.start;
+
+                Message::Account(MessageAccount::Limited {
+                    pubkey: message.pubkey,
+                    owner: message.owner,
+                    lamports: message.lamports,
+                    executable: message.executable,
+                    rent_epoch: message.rent_epoch,
+                    data: data_range,
+                    txn_signature_offset: message
+                        .txn_signature_offset
+                        .map(|offset| offset + range.start),
+                    write_version: message.write_version + range.start,
+                    slot: message.slot,
+                    is_startup: message.is_startup,
+                    created_at,
+                    buffer: data,
+                    account_offset: message.account + range.start,
+                    range,
+                })
+            }
+            UpdateOneofLimitedDecode::Transaction(range) => {
+                let message = UpdateOneofLimitedDecodeTransaction::decode(
+                    &data.as_slice()[range.start..range.end],
+                )?;
+                let mut transaction_range = message
+                    .transaction
+                    .ok_or(MessageParseError::FieldNotDefined("transaction"))?;
+                transaction_range.start += range.start;
+                transaction_range.end += range.start;
+
+                let tx_info = UpdateOneofLimitedDecodeTransactionInfo::decode(
+                    &data.as_slice()[transaction_range.start..transaction_range.end],
+                )?;
+
+                let error = tx_info
+                    .err
+                    .map(|err_range| {
+                        TransactionError::decode(
+                            &data.as_slice()[transaction_range.start + err_range.start
+                                ..transaction_range.start + err_range.end],
+                        )
                     })
-                }
-                UpdateOneofLimitedDecode::Account(range) => {
-                    let message = UpdateOneofLimitedDecodeAccount::decode(
-                        &data.as_slice()[range.start..range.end],
-                    )?;
+                    .transpose()?;
 
-                    if message.account == usize::MAX {
-                        return Err(MessageParseError::FieldNotDefined("account"));
-                    }
+                Message::Transaction(MessageTransaction::Limited {
+                    signature_offset: tx_info
+                        .signature_offset
+                        .map(|offset| transaction_range.start + offset),
+                    error,
+                    account_keys: tx_info.account_keys,
+                    is_vote: tx_info.is_vote,
+                    index: tx_info.index,
+                    transaction_range,
+                    transaction: OnceLock::new(),
+                    slot: message.slot,
+                    created_at,
+                    buffer: data,
+                    range,
+                })
+            }
+            UpdateOneofLimitedDecode::TransactionStatus(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("TransactionStatus"));
+            }
+            UpdateOneofLimitedDecode::Entry(range) => {
+                let entry = UpdateOneofLimitedDecodeEntry::decode(
+                    &data.as_slice()[range.start..range.end],
+                )?;
+                Message::Entry(MessageEntry::Limited {
+                    slot: entry.slot,
+                    index: entry.index,
+                    executed_transaction_count: entry.executed_transaction_count,
+                    created_at,
+                    buffer: data,
+                    range,
+                })
+            }
+            UpdateOneofLimitedDecode::BlockMeta(range) => {
+                let block_meta =
+                    SubscribeUpdateBlockMeta::decode(&data.as_slice()[range.start..range.end])?;
 
-                    let mut data_range = message.data;
-                    data_range.start += range.start;
-                    data_range.end += range.start;
+                let block_height = block_meta
+                    .block_height
+                    .map(|v| v.block_height)
+                    .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
 
-                    Message::Account(MessageAccount::Limited {
-                        pubkey: message.pubkey,
-                        owner: message.owner,
-                        lamports: message.lamports,
-                        executable: message.executable,
-                        rent_epoch: message.rent_epoch,
-                        data: data_range,
-                        txn_signature_offset: message
-                            .txn_signature_offset
-                            .map(|offset| offset + range.start),
-                        write_version: message.write_version + range.start,
-                        slot: message.slot,
-                        is_startup: message.is_startup,
-                        created_at,
-                        buffer: data,
-                        account_offset: message.account + range.start,
-                        range,
-                    })
-                }
-                UpdateOneofLimitedDecode::Transaction(range) => {
-                    let message = UpdateOneofLimitedDecodeTransaction::decode(
-                        &data.as_slice()[range.start..range.end],
-                    )?;
-                    let mut transaction_range = message
-                        .transaction
-                        .ok_or(MessageParseError::FieldNotDefined("transaction"))?;
-                    transaction_range.start += range.start;
-                    transaction_range.end += range.start;
-
-                    let tx_info = UpdateOneofLimitedDecodeTransactionInfo::decode(
-                        &data.as_slice()[transaction_range.start..transaction_range.end],
-                    )?;
-
-                    let error = tx_info
-                        .err
-                        .map(|err_range| {
-                            TransactionError::decode(
-                                &data.as_slice()[transaction_range.start + err_range.start
-                                    ..transaction_range.start + err_range.end],
-                            )
-                        })
-                        .transpose()?;
-
-                    Message::Transaction(MessageTransaction::Limited {
-                        signature_offset: tx_info
-                            .signature_offset
-                            .map(|offset| transaction_range.start + offset),
-                        error,
-                        account_keys: tx_info.account_keys,
-                        is_vote: tx_info.is_vote,
-                        index: tx_info.index,
-                        transaction_range,
-                        transaction: OnceLock::new(),
-                        slot: message.slot,
-                        created_at,
-                        buffer: data,
-                        range,
-                    })
-                }
-                UpdateOneofLimitedDecode::TransactionStatus(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("TransactionStatus"));
-                }
-                UpdateOneofLimitedDecode::Entry(range) => {
-                    let entry = UpdateOneofLimitedDecodeEntry::decode(
-                        &data.as_slice()[range.start..range.end],
-                    )?;
-                    Message::Entry(MessageEntry::Limited {
-                        slot: entry.slot,
-                        index: entry.index,
-                        executed_transaction_count: entry.executed_transaction_count,
-                        created_at,
-                        buffer: data,
-                        range,
-                    })
-                }
-                UpdateOneofLimitedDecode::BlockMeta(range) => {
-                    let block_meta =
-                        SubscribeUpdateBlockMeta::decode(&data.as_slice()[range.start..range.end])?;
-
-                    let block_height = block_meta
-                        .block_height
-                        .map(|v| v.block_height)
-                        .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
-
-                    Message::BlockMeta(MessageBlockMeta::Limited {
-                        block_meta,
-                        block_height,
-                        created_at,
-                        buffer: data,
-                        range,
-                    })
-                }
-                UpdateOneofLimitedDecode::Block(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("Block"));
-                }
-                UpdateOneofLimitedDecode::Ping(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("Ping"));
-                }
-                UpdateOneofLimitedDecode::Pong(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("Pong"));
-                }
-            },
-        )
+                Message::BlockMeta(MessageBlockMeta::Limited {
+                    block_meta,
+                    block_height,
+                    created_at,
+                    buffer: data,
+                    range,
+                })
+            }
+            UpdateOneofLimitedDecode::Block(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("Block"));
+            }
+            UpdateOneofLimitedDecode::Ping(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("Ping"));
+            }
+            UpdateOneofLimitedDecode::Pong(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("Pong"));
+            }
+        })
     }
 }
 
@@ -347,187 +350,191 @@ impl MessageParserProst {
             .created_at
             .ok_or(MessageParseError::FieldNotDefined("created_at"))?;
 
-        Ok(
-            match update
-                .update_oneof
-                .ok_or(MessageParseError::FieldNotDefined("update_oneof"))?
-            {
-                UpdateOneof::Slot(message) => Message::Slot(MessageSlot::Prost {
+        let Some(update_oneof) = update.update_oneof else {
+            // Yellowstone `SubscribeUpdate` skips Richat-only updates (tags `100+`)
+            let update = SubscribeUpdateRichat::decode(data.deref())?;
+            return Err(if update.update_oneof.is_some() {
+                MessageParseError::InvalidUpdateMessage("Richat")
+            } else {
+                MessageParseError::FieldNotDefined("update_oneof")
+            });
+        };
+
+        Ok(match update_oneof {
+            UpdateOneof::Slot(message) => Message::Slot(MessageSlot::Prost {
+                slot: message.slot,
+                parent: message.parent,
+                status: SlotStatus::try_from(message.status)
+                    .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
+                dead_error: message.dead_error,
+                created_at,
+                size: encoded_len,
+            }),
+            UpdateOneof::Account(message) => {
+                let account = message
+                    .account
+                    .ok_or(MessageParseError::FieldNotDefined("account"))?;
+                Message::Account(MessageAccount::Prost {
+                    pubkey: account
+                        .pubkey
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| MessageParseError::InvalidPubkey)?,
+                    owner: account
+                        .owner
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| MessageParseError::InvalidPubkey)?,
+                    account,
                     slot: message.slot,
-                    parent: message.parent,
-                    status: SlotStatus::try_from(message.status)
-                        .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
-                    dead_error: message.dead_error,
+                    is_startup: message.is_startup,
+                    created_at,
+                    size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 20,
+                })
+            }
+            UpdateOneof::Transaction(message) => {
+                let transaction = message
+                    .transaction
+                    .ok_or(MessageParseError::FieldNotDefined("transaction"))?;
+                let meta = transaction
+                    .meta
+                    .as_ref()
+                    .ok_or(MessageParseError::FieldNotDefined("meta"))?;
+
+                let account_keys = MessageTransaction::gen_account_keys_prost(&transaction, meta)?;
+                let account_keys_capacity = account_keys.capacity();
+
+                Message::Transaction(MessageTransaction::Prost {
+                    error: meta.err.clone(),
+                    account_keys,
+                    transaction,
+                    slot: message.slot,
+                    created_at,
+                    size: encoded_len + SIGNATURE_BYTES + account_keys_capacity * PUBKEY_BYTES,
+                })
+            }
+            UpdateOneof::TransactionStatus(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("TransactionStatus"));
+            }
+            UpdateOneof::Entry(entry) => Message::Entry(MessageEntry::Prost {
+                entry,
+                created_at,
+                size: encoded_len,
+            }),
+            UpdateOneof::BlockMeta(block_meta) => {
+                let block_height = block_meta
+                    .block_height
+                    .map(|v| v.block_height)
+                    .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
+                Message::BlockMeta(MessageBlockMeta::Prost {
+                    block_meta,
+                    block_height,
                     created_at,
                     size: encoded_len,
-                }),
-                UpdateOneof::Account(message) => {
-                    let account = message
-                        .account
-                        .ok_or(MessageParseError::FieldNotDefined("account"))?;
-                    Message::Account(MessageAccount::Prost {
-                        pubkey: account
-                            .pubkey
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| MessageParseError::InvalidPubkey)?,
-                        owner: account
-                            .owner
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| MessageParseError::InvalidPubkey)?,
-                        account,
-                        slot: message.slot,
-                        is_startup: message.is_startup,
-                        created_at,
-                        size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 20,
+                })
+            }
+            UpdateOneof::Block(message) => {
+                let accounts = message
+                    .accounts
+                    .into_iter()
+                    .map(|account| {
+                        let encoded_len = account.encoded_len();
+                        Ok(Arc::new(MessageAccount::Prost {
+                            pubkey: account
+                                .pubkey
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| MessageParseError::InvalidPubkey)?,
+                            owner: account
+                                .owner
+                                .as_slice()
+                                .try_into()
+                                .map_err(|_| MessageParseError::InvalidPubkey)?,
+                            account,
+                            slot: message.slot,
+                            is_startup: false,
+                            created_at,
+                            size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 32,
+                        }))
                     })
-                }
-                UpdateOneof::Transaction(message) => {
-                    let transaction = message
-                        .transaction
-                        .ok_or(MessageParseError::FieldNotDefined("transaction"))?;
-                    let meta = transaction
-                        .meta
-                        .as_ref()
-                        .ok_or(MessageParseError::FieldNotDefined("meta"))?;
+                    .collect::<Result<_, MessageParseError>>()?;
 
-                    let account_keys =
-                        MessageTransaction::gen_account_keys_prost(&transaction, meta)?;
-                    let account_keys_capacity = account_keys.capacity();
+                let transactions = message
+                    .transactions
+                    .into_iter()
+                    .map(|transaction| {
+                        let meta = transaction
+                            .meta
+                            .as_ref()
+                            .ok_or(MessageParseError::FieldNotDefined("meta"))?;
 
-                    Message::Transaction(MessageTransaction::Prost {
-                        error: meta.err.clone(),
-                        account_keys,
-                        transaction,
-                        slot: message.slot,
-                        created_at,
-                        size: encoded_len + SIGNATURE_BYTES + account_keys_capacity * PUBKEY_BYTES,
+                        let account_keys =
+                            MessageTransaction::gen_account_keys_prost(&transaction, meta)?;
+                        let account_keys_capacity = account_keys.capacity();
+
+                        Ok(Arc::new(MessageTransaction::Prost {
+                            error: meta.err.clone(),
+                            account_keys,
+                            transaction,
+                            slot: message.slot,
+                            created_at,
+                            size: encoded_len
+                                + SIGNATURE_BYTES
+                                + account_keys_capacity * PUBKEY_BYTES,
+                        }))
                     })
-                }
-                UpdateOneof::TransactionStatus(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("TransactionStatus"));
-                }
-                UpdateOneof::Entry(entry) => Message::Entry(MessageEntry::Prost {
-                    entry,
-                    created_at,
-                    size: encoded_len,
-                }),
-                UpdateOneof::BlockMeta(block_meta) => {
-                    let block_height = block_meta
-                        .block_height
-                        .map(|v| v.block_height)
-                        .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
-                    Message::BlockMeta(MessageBlockMeta::Prost {
+                    .collect::<Result<_, MessageParseError>>()?;
+
+                let entries = message
+                    .entries
+                    .into_iter()
+                    .map(|entry| {
+                        let encoded_len = entry.encoded_len();
+                        Arc::new(MessageEntry::Prost {
+                            entry,
+                            created_at,
+                            size: encoded_len,
+                        })
+                    })
+                    .collect();
+
+                let block_meta = SubscribeUpdateBlockMeta {
+                    slot: message.slot,
+                    blockhash: message.blockhash,
+                    rewards: message.rewards,
+                    block_time: message.block_time,
+                    block_height: message.block_height,
+                    parent_slot: message.parent_slot,
+                    parent_blockhash: message.parent_blockhash,
+                    executed_transaction_count: message.executed_transaction_count,
+                    entries_count: message.entries_count,
+                };
+                let encoded_len = block_meta.encoded_len();
+                let block_height = block_meta
+                    .block_height
+                    .map(|v| v.block_height)
+                    .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
+
+                Message::Block(MessageBlock {
+                    accounts,
+                    transactions,
+                    entries,
+                    block_meta: Arc::new(MessageBlockMeta::Prost {
                         block_meta,
                         block_height,
                         created_at,
                         size: encoded_len,
-                    })
-                }
-                UpdateOneof::Block(message) => {
-                    let accounts = message
-                        .accounts
-                        .into_iter()
-                        .map(|account| {
-                            let encoded_len = account.encoded_len();
-                            Ok(Arc::new(MessageAccount::Prost {
-                                pubkey: account
-                                    .pubkey
-                                    .as_slice()
-                                    .try_into()
-                                    .map_err(|_| MessageParseError::InvalidPubkey)?,
-                                owner: account
-                                    .owner
-                                    .as_slice()
-                                    .try_into()
-                                    .map_err(|_| MessageParseError::InvalidPubkey)?,
-                                account,
-                                slot: message.slot,
-                                is_startup: false,
-                                created_at,
-                                size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 32,
-                            }))
-                        })
-                        .collect::<Result<_, MessageParseError>>()?;
-
-                    let transactions = message
-                        .transactions
-                        .into_iter()
-                        .map(|transaction| {
-                            let meta = transaction
-                                .meta
-                                .as_ref()
-                                .ok_or(MessageParseError::FieldNotDefined("meta"))?;
-
-                            let account_keys =
-                                MessageTransaction::gen_account_keys_prost(&transaction, meta)?;
-                            let account_keys_capacity = account_keys.capacity();
-
-                            Ok(Arc::new(MessageTransaction::Prost {
-                                error: meta.err.clone(),
-                                account_keys,
-                                transaction,
-                                slot: message.slot,
-                                created_at,
-                                size: encoded_len
-                                    + SIGNATURE_BYTES
-                                    + account_keys_capacity * PUBKEY_BYTES,
-                            }))
-                        })
-                        .collect::<Result<_, MessageParseError>>()?;
-
-                    let entries = message
-                        .entries
-                        .into_iter()
-                        .map(|entry| {
-                            let encoded_len = entry.encoded_len();
-                            Arc::new(MessageEntry::Prost {
-                                entry,
-                                created_at,
-                                size: encoded_len,
-                            })
-                        })
-                        .collect();
-
-                    let block_meta = SubscribeUpdateBlockMeta {
-                        slot: message.slot,
-                        blockhash: message.blockhash,
-                        rewards: message.rewards,
-                        block_time: message.block_time,
-                        block_height: message.block_height,
-                        parent_slot: message.parent_slot,
-                        parent_blockhash: message.parent_blockhash,
-                        executed_transaction_count: message.executed_transaction_count,
-                        entries_count: message.entries_count,
-                    };
-                    let encoded_len = block_meta.encoded_len();
-                    let block_height = block_meta
-                        .block_height
-                        .map(|v| v.block_height)
-                        .ok_or(MessageParseError::FieldNotDefined("block_height"))?;
-
-                    Message::Block(MessageBlock {
-                        accounts,
-                        transactions,
-                        entries,
-                        block_meta: Arc::new(MessageBlockMeta::Prost {
-                            block_meta,
-                            block_height,
-                            created_at,
-                            size: encoded_len,
-                        }),
-                        created_at: MessageBlockCreatedAt::Prost(created_at),
-                    })
-                }
-                UpdateOneof::Ping(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("Ping"));
-                }
-                UpdateOneof::Pong(_) => {
-                    return Err(MessageParseError::InvalidUpdateMessage("Pong"));
-                }
-            },
-        )
+                    }),
+                    created_at: MessageBlockCreatedAt::Prost(created_at),
+                })
+            }
+            UpdateOneof::Ping(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("Ping"));
+            }
+            UpdateOneof::Pong(_) => {
+                return Err(MessageParseError::InvalidUpdateMessage("Pong"));
+            }
+        })
     }
 }
 
@@ -1302,7 +1309,7 @@ impl MessageBlockCreatedAt {
 #[cfg(test)]
 mod tests {
     use {
-        super::{Message, MessageAccount, MessageParserEncoding, MessageRef},
+        super::{Message, MessageAccount, MessageParseError, MessageParserEncoding, MessageRef},
         crate::{
             config::{ConfigFilter, ConfigFilterAccounts, ConfigFilterAccountsDataSlice},
             filter::Filter,
@@ -1345,6 +1352,43 @@ mod tests {
         let updates = filter.get_updates_ref(message_ref, CommitmentLevel::Processed);
         assert_eq!(updates.len(), 1, "unexpected number of updates");
         updates[0].encode_to_vec()
+    }
+
+    #[test]
+    fn test_richat_update_is_skipped() {
+        use {
+            prost::Message as _,
+            richat_proto::{
+                geyser::SubscribeUpdateContactInfoRemoved,
+                richat::{
+                    SubscribeUpdateRichat,
+                    subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
+                },
+            },
+        };
+
+        let data = SubscribeUpdateRichat {
+            update_oneof: Some(UpdateOneofRichat::ContactInfoRemoved(
+                SubscribeUpdateContactInfoRemoved {
+                    pubkey: vec![42; 32],
+                },
+            )),
+            created_at: Some(prost_types::Timestamp {
+                seconds: 1_757_500_000,
+                nanos: 42,
+            }),
+        }
+        .encode_to_vec();
+
+        for parser in [MessageParserEncoding::Limited, MessageParserEncoding::Prost] {
+            assert!(
+                matches!(
+                    Message::parse(data.clone().into(), parser),
+                    Err(MessageParseError::InvalidUpdateMessage("Richat"))
+                ),
+                "unexpected result for {parser:?}"
+            );
+        }
     }
 
     #[test]
