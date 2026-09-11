@@ -215,13 +215,21 @@ impl Harness {
         if compression {
             config.chunk_compression = Some(ChunkCompression::Zstd(1));
         }
+        Self::with_storage(parser, Some(config), 8)
+    }
+
+    fn with_storage(
+        parser: MessageParserEncoding,
+        storage: Option<ConfigStorage>,
+        max_messages: usize,
+    ) -> Self {
         let shutdown = CancellationToken::new();
         let (mut messages, threads) = Messages::new(
             parser,
             ConfigChannelInner {
-                max_messages: 8,
+                max_messages,
                 max_bytes: 1_000_000,
-                storage: Some(config),
+                storage,
             },
             false,
             true,
@@ -279,6 +287,7 @@ impl Harness {
         state.commitment = level;
         state.replay_from_slot = Some(from);
         state.replay_generation = 1;
+        state.recovery_epoch = self.messages().recovery_epoch(level);
         state.filter = Some(filter(level));
         assert!(
             matches!(state.head, IndexLocation::Storage(_)),
@@ -400,6 +409,27 @@ fn replay_survives_restart_and_joins_new_live_events() {
     drop(first);
     let mut second = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
     assert_eq!(second.sender.as_ref().unwrap().index, next_index);
+    let upstream_resume = second
+        .sender
+        .as_ref()
+        .unwrap()
+        .global_replay_from_slot
+        .clone();
+    assert_eq!(
+        upstream_resume.load(),
+        Some(15),
+        "stored finalized slots 10..=14 must not be requested upstream"
+    );
+    // Serve historical subscriptions before any upstream reconnect or new input.
+    for (idx, level) in LEVELS.into_iter().enumerate() {
+        let client = second.client(10, level);
+        assert_eq!(second.finish_replay(&client), expected[idx]);
+        assert_eq!(
+            upstream_resume.load(),
+            Some(15),
+            "downstream disk replay must not rewind the upstream subscription"
+        );
+    }
     for event in block(16) {
         second.push(event);
     } // slot 15 skipped
@@ -666,6 +696,16 @@ fn unfinalized_restart_deduplicates_replayed_source_events() {
     let next_index = first.sender.as_ref().unwrap().index;
     drop(first);
     let mut second = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
+    assert_eq!(
+        second
+            .sender
+            .as_ref()
+            .unwrap()
+            .global_replay_from_slot
+            .load(),
+        Some(11),
+        "slot 10 is complete on disk, but slot 11 still needs its finalization"
+    );
     for event in pending {
         second.push(event);
     }
@@ -755,6 +795,15 @@ fn damaged_segment_returns_data_loss_instead_of_silently_skipping_history() {
 // carried by an in-process duplex transport, with Richat's actual gRPC service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn yellowstone_client_replays_blocks_and_all_event_types_without_old_rejection() {
+    check_yellowstone_wire(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yellowstone_client_subscribes_before_filter_and_receives_live_blocks() {
+    check_yellowstone_wire(false).await;
+}
+
+async fn check_yellowstone_wire(replay: bool) {
     use {
         crate::grpc::server::{GrpcServer, geyser_gen::geyser_server::GeyserServer},
         hyper_util::rt::TokioIo,
@@ -783,13 +832,19 @@ async fn yellowstone_client_replays_blocks_and_all_event_types_without_old_rejec
         }
     }
     let dir = TempDir::new();
-    let mut harness = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
-    for slot in 10..25 {
-        for event in block(slot) {
-            harness.push(event);
+    let mut harness = if replay {
+        Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true)
+    } else {
+        Harness::with_storage(MessageParserEncoding::Prost, None, 256)
+    };
+    if replay {
+        for slot in 10..25 {
+            for event in block(slot) {
+                harness.push(event);
+            }
         }
+        harness.flush();
     }
-    harness.flush();
     let shutdown = CancellationToken::new();
     struct CancelOnDrop(CancellationToken);
     impl Drop for CancelOnDrop {
@@ -821,10 +876,13 @@ async fn yellowstone_client_replays_blocks_and_all_event_types_without_old_rejec
     .expect("connect timeout")
     .unwrap();
     let mut client = GeyserClient::new(channel);
+    client
+        .get_version(richat_proto::geyser::GetVersionRequest {})
+        .await
+        .unwrap();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut initial = request(CommitmentLevel::Processed);
     initial.from_slot = Some(11);
-    tx.send(initial).unwrap();
     let requests = futures::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|request| (request, rx))
     });
@@ -833,162 +891,255 @@ async fn yellowstone_client_replays_blocks_and_all_event_types_without_old_rejec
         .expect("subscribe timeout")
         .unwrap()
         .into_inner();
-    for (round, level) in [
-        CommitmentLevel::Processed,
-        CommitmentLevel::Confirmed,
-        CommitmentLevel::Finalized,
-        CommitmentLevel::Finalized,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        // The last round repeats from_slot without changing commitment.
-        if round != 0 {
-            let mut next = request(level);
-            next.from_slot = Some(11);
-            tx.send(next).unwrap();
-        }
-        let idx = LEVELS
-            .iter()
-            .position(|candidate| *candidate == level)
-            .unwrap();
-        let expected: Vec<_> = harness.expected[idx]
-            .iter()
-            .filter(|update| update_slot(update) >= 11)
-            .cloned()
-            .collect();
-        let mut actual = vec![];
-        while actual.len() < expected.len() {
-            let update = tokio::time::timeout(Duration::from_secs(10), stream.message())
-                .await
-                .unwrap()
-                .expect("from_slot must not reject blocks or any other supported filter")
-                .unwrap();
-            if !matches!(
-                update.update_oneof,
-                Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_))
-            ) {
-                actual.push(update);
-            }
-        }
-        assert_eq!(
-            actual, expected,
-            "official Yellowstone client at {level:?}, round {round}"
-        );
-    }
-    // Exercise focused filters through the wire codec as well as the mixed stream.
-    for category in 0..3 {
-        let level = if category == 1 {
-            CommitmentLevel::Processed
-        } else {
-            CommitmentLevel::Finalized
-        };
-        let mut focused = SubscribeRequest {
-            from_slot: Some(11),
-            commitment: Some(if category == 1 { 0 } else { 2 }),
-            ..Default::default()
-        };
-        let idx = LEVELS
-            .iter()
-            .position(|candidate| *candidate == level)
-            .unwrap();
-        let expected: Vec<_> = harness.expected[idx]
-            .iter()
-            .filter(|update| update_slot(update) >= 11)
-            .filter_map(|update| {
-                let mut update = update.clone();
-                match (&mut update.update_oneof, category) {
-                    (Some(UpdateOneof::Block(block)), 0) => {
-                        block.accounts.clear();
-                        block.transactions.clear();
-                        block.entries.clear();
-                        Some(update)
-                    }
-                    (Some(UpdateOneof::Account(account)), 1)
-                        if account.account.as_ref().unwrap().lamports == 2 =>
-                    {
-                        account.account.as_mut().unwrap().data = vec![3; 7];
-                        Some(update)
-                    }
-                    (Some(UpdateOneof::Transaction(_) | UpdateOneof::TransactionStatus(_)), 2) => {
-                        Some(update)
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-        match category {
-            0 => {
-                focused.blocks.insert(
-                    "blocks".into(),
-                    SubscribeRequestFilterBlocks {
-                        include_accounts: Some(false),
-                        include_transactions: Some(false),
-                        include_entries: Some(false),
-                        ..Default::default()
-                    },
-                );
-            }
-            1 => {
-                use richat_proto::geyser::{
-                    SubscribeRequestAccountsDataSlice, SubscribeRequestFilterAccountsFilter,
-                    SubscribeRequestFilterAccountsFilterLamports,
-                    subscribe_request_filter_accounts_filter::Filter as AccountFilter,
-                    subscribe_request_filter_accounts_filter_lamports::Cmp,
-                };
-                focused.accounts.insert(
-                    "accounts".into(),
-                    SubscribeRequestFilterAccounts {
-                        owner: vec![Pubkey::from([2; 32]).to_string()],
-                        filters: vec![SubscribeRequestFilterAccountsFilter {
-                            filter: Some(AccountFilter::Lamports(
-                                SubscribeRequestFilterAccountsFilterLamports {
-                                    cmp: Some(Cmp::Eq(2)),
-                                },
-                            )),
-                        }],
-                        ..Default::default()
-                    },
-                );
-                focused
-                    .accounts_data_slice
-                    .push(SubscribeRequestAccountsDataSlice {
-                        offset: 2,
-                        length: 7,
-                    });
-            }
-            _ => {
-                let transactions = richat_proto::geyser::SubscribeRequestFilterTransactions {
-                    vote: Some(false),
-                    failed: Some(false),
+    if replay {
+        tx.send(initial).unwrap();
+    } else {
+        // Match the Node SDK usage: getVersion -> await subscribe -> write filter.
+        tx.send(SubscribeRequest {
+            commitment: Some(0),
+            blocks: HashMap::from([(
+                "filteredBlocks".into(),
+                SubscribeRequestFilterBlocks {
                     account_include: vec![Pubkey::from([1; 32]).to_string()],
+                    include_transactions: Some(true),
+                    include_accounts: Some(false),
+                    include_entries: Some(false),
                     ..Default::default()
-                };
-                focused
-                    .transactions
-                    .insert("transactions".into(), transactions.clone());
-                focused
-                    .transactions_status
-                    .insert("status".into(), transactions);
-            }
-        }
-        tx.send(focused).unwrap();
-        let mut actual = vec![];
-        while actual.len() < expected.len() {
-            let update = tokio::time::timeout(Duration::from_secs(10), stream.message())
+                },
+            )]),
+            ..Default::default()
+        })
+        .unwrap();
+        // A pong acknowledges all earlier requests on the same HTTP/2 stream.
+        tx.send(SubscribeRequest {
+            ping: Some(richat_proto::geyser::SubscribeRequestPing { id: 42 }),
+            ..Default::default()
+        })
+        .unwrap();
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
                 .await
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            if !matches!(
-                update.update_oneof,
-                Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_))
-            ) {
-                actual.push(update);
+            if let Some(UpdateOneof::Pong(pong)) = update.update_oneof {
+                assert_eq!(pong.id, 42);
+                break;
             }
         }
-        assert!(!expected.is_empty());
-        assert_eq!(actual, expected, "focused filter category {category}");
+        for event in block(10) {
+            harness.push(event);
+        }
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(UpdateOneof::Block(block)) = update.update_oneof {
+                assert_eq!(update.filters, ["filteredBlocks"]);
+                assert_eq!(block.slot, 10);
+                assert_eq!(block.transactions.len(), 1);
+                assert!(block.accounts.is_empty());
+                assert!(block.entries.is_empty());
+                break;
+            }
+        }
+        // A live subscriber must stay connected across the upstream fallback.
+        harness.sender.as_mut().unwrap().begin_live_epoch().unwrap();
+        for event in block(1000) {
+            harness.push(event);
+        }
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(UpdateOneof::Block(block)) = update.update_oneof {
+                assert_eq!(block.slot, 1000);
+                break;
+            }
+        }
+        // The same subscriber explicitly asking for missing history must fail,
+        // never inherit the upstream-only fallback-to-live policy.
+        let mut historical = request(CommitmentLevel::Processed);
+        historical.from_slot = Some(10);
+        tx.send(historical).unwrap();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+            {
+                Err(status) => {
+                    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+                    assert!(status.message().contains("replay position"));
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("missing client history must return an explicit error"),
+            }
+        }
+    }
+    if replay {
+        for (round, level) in [
+            CommitmentLevel::Processed,
+            CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized,
+            CommitmentLevel::Finalized,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The last round repeats from_slot without changing commitment.
+            if round != 0 {
+                let mut next = request(level);
+                next.from_slot = Some(11);
+                tx.send(next).unwrap();
+            }
+            let idx = LEVELS
+                .iter()
+                .position(|candidate| *candidate == level)
+                .unwrap();
+            let expected: Vec<_> = harness.expected[idx]
+                .iter()
+                .filter(|update| update_slot(update) >= 11)
+                .cloned()
+                .collect();
+            let mut actual = vec![];
+            while actual.len() < expected.len() {
+                let update = tokio::time::timeout(Duration::from_secs(10), stream.message())
+                    .await
+                    .unwrap()
+                    .expect("from_slot must not reject blocks or any other supported filter")
+                    .unwrap();
+                if !matches!(
+                    update.update_oneof,
+                    Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_))
+                ) {
+                    actual.push(update);
+                }
+            }
+            assert_eq!(
+                actual, expected,
+                "official Yellowstone client at {level:?}, round {round}"
+            );
+        }
+        // Exercise focused filters through the wire codec as well as the mixed stream.
+        for category in 0..3 {
+            let level = if category == 1 {
+                CommitmentLevel::Processed
+            } else {
+                CommitmentLevel::Finalized
+            };
+            let mut focused = SubscribeRequest {
+                from_slot: Some(11),
+                commitment: Some(if category == 1 { 0 } else { 2 }),
+                ..Default::default()
+            };
+            let idx = LEVELS
+                .iter()
+                .position(|candidate| *candidate == level)
+                .unwrap();
+            let expected: Vec<_> = harness.expected[idx]
+                .iter()
+                .filter(|update| update_slot(update) >= 11)
+                .filter_map(|update| {
+                    let mut update = update.clone();
+                    match (&mut update.update_oneof, category) {
+                        (Some(UpdateOneof::Block(block)), 0) => {
+                            block.accounts.clear();
+                            block.transactions.clear();
+                            block.entries.clear();
+                            Some(update)
+                        }
+                        (Some(UpdateOneof::Account(account)), 1)
+                            if account.account.as_ref().unwrap().lamports == 2 =>
+                        {
+                            account.account.as_mut().unwrap().data = vec![3; 7];
+                            Some(update)
+                        }
+                        (
+                            Some(UpdateOneof::Transaction(_) | UpdateOneof::TransactionStatus(_)),
+                            2,
+                        ) => Some(update),
+                        _ => None,
+                    }
+                })
+                .collect();
+            match category {
+                0 => {
+                    focused.blocks.insert(
+                        "blocks".into(),
+                        SubscribeRequestFilterBlocks {
+                            include_accounts: Some(false),
+                            include_transactions: Some(false),
+                            include_entries: Some(false),
+                            ..Default::default()
+                        },
+                    );
+                }
+                1 => {
+                    use richat_proto::geyser::{
+                        SubscribeRequestAccountsDataSlice, SubscribeRequestFilterAccountsFilter,
+                        SubscribeRequestFilterAccountsFilterLamports,
+                        subscribe_request_filter_accounts_filter::Filter as AccountFilter,
+                        subscribe_request_filter_accounts_filter_lamports::Cmp,
+                    };
+                    focused.accounts.insert(
+                        "accounts".into(),
+                        SubscribeRequestFilterAccounts {
+                            owner: vec![Pubkey::from([2; 32]).to_string()],
+                            filters: vec![SubscribeRequestFilterAccountsFilter {
+                                filter: Some(AccountFilter::Lamports(
+                                    SubscribeRequestFilterAccountsFilterLamports {
+                                        cmp: Some(Cmp::Eq(2)),
+                                    },
+                                )),
+                            }],
+                            ..Default::default()
+                        },
+                    );
+                    focused
+                        .accounts_data_slice
+                        .push(SubscribeRequestAccountsDataSlice {
+                            offset: 2,
+                            length: 7,
+                        });
+                }
+                _ => {
+                    let transactions = richat_proto::geyser::SubscribeRequestFilterTransactions {
+                        vote: Some(false),
+                        failed: Some(false),
+                        account_include: vec![Pubkey::from([1; 32]).to_string()],
+                        ..Default::default()
+                    };
+                    focused
+                        .transactions
+                        .insert("transactions".into(), transactions.clone());
+                    focused
+                        .transactions_status
+                        .insert("status".into(), transactions);
+                }
+            }
+            tx.send(focused).unwrap();
+            let mut actual = vec![];
+            while actual.len() < expected.len() {
+                let update = tokio::time::timeout(Duration::from_secs(10), stream.message())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                if !matches!(
+                    update.update_oneof,
+                    Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_))
+                ) {
+                    actual.push(update);
+                }
+            }
+            assert!(!expected.is_empty());
+            assert_eq!(actual, expected, "focused filter category {category}");
+        }
     }
     drop(stream);
     drop(tx);
@@ -1125,4 +1276,83 @@ fn committed_accounts_and_blocks_keep_only_the_highest_write_version() {
         assert_eq!(block.accounts.len(), 1);
         assert_eq!(block.accounts[0].write_version, 2);
     }
+}
+
+#[test]
+fn upstream_gap_invalidates_replay_and_persists_the_new_capture_boundary() {
+    let dir = TempDir::new();
+    let mut harness = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
+    for slot in 10..20 {
+        for event in block(slot) {
+            harness.push(event);
+        }
+    }
+    harness.flush();
+    let client = harness.client(10, CommitmentLevel::Processed);
+    // Hold the output queue full so replay remains active across the gap.
+    client.messages_len.store(usize::MAX, Ordering::Relaxed);
+    let boundary = harness.sender.as_ref().unwrap().index;
+    harness.sender.as_mut().unwrap().begin_live_epoch().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(Err(status)) = client.pop_for_test() {
+            assert_eq!(status.code(), tonic::Code::DataLoss);
+            assert!(status.message().contains("gap"));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(client);
+    drop(harness);
+    // Even a restart before the first new live event must not reuse the old cursor.
+    let mut harness = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
+    assert_eq!(
+        harness
+            .sender
+            .as_ref()
+            .unwrap()
+            .global_replay_from_slot
+            .load(),
+        None
+    );
+    assert_eq!(harness.sender.as_ref().unwrap().index, boundary);
+    for level in LEVELS {
+        assert!(
+            harness
+                .messages()
+                .get_current_tail_with_replay(level, Some(10))
+                .is_err()
+        );
+    }
+    for slot in 1000..1010 {
+        for event in block(slot) {
+            harness.push(event);
+        }
+    }
+    harness.flush();
+    for (idx, level) in LEVELS.into_iter().enumerate() {
+        assert!(
+            harness
+                .messages()
+                .get_current_tail_with_replay(level, Some(10))
+                .is_err()
+        );
+        assert_eq!(
+            harness.finish_replay(&harness.client(1000, level)),
+            harness.expected[idx]
+        );
+    }
+    drop(harness);
+    let harness = Harness::open(&dir.0, MessageParserEncoding::Prost, 3000, true);
+    assert_eq!(
+        harness
+            .sender
+            .as_ref()
+            .unwrap()
+            .global_replay_from_slot
+            .load(),
+        Some(1010)
+    );
+    assert_eq!(harness.messages().get_first_available_slot(), Some(1000));
 }

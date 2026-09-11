@@ -12,6 +12,10 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Fixes
 
+- richat: when upstream recovery history is unavailable, reconnect live without `from_slot` instead of retrying the stale cursor; recognize Yellowstone's `OUT_OF_RANGE` response and reset backoff only after receiving source data.
+- richat: persist recovery gaps and keep explicit client replay strict: unavailable history errors instead of silently falling back to live.
+- filter: emit each matching block filter name once instead of eight times.
+- richat: verify subscribe-before-filter live block delivery and that disk replay after restart does not rewind upstream recovery into fully finalized stored history.
 - richat: fix inclusive disk replay cursors, bounded decoding, and handoff to the matching live commitment; cancel stale replay workers on subscription changes.
 - richat: preserve journal indices and payload references across restart, handle skipped slots, and stop advertising partially evicted memory slots.
 - richat: keep the highest account write version in committed streams and reconstructed blocks when updates arrive out of order.

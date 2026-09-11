@@ -138,6 +138,10 @@ fn main() -> anyhow::Result<()> {
                             biased;
                             message = stream.next() => match message {
                                 Some(Ok((source_name, message))) => sender.push(dedup_required, source_name, message),
+                                Some(Err(ReceiveError::ReplayGap { from_slot })) => {
+                                    warn!(from_slot, "starting live capture after unavailable upstream history");
+                                    sender.begin_live_epoch()?;
+                                },
                                 Some(Err(error @ ReceiveError::ReplayFailed)) => {
                                     eprintln!("Error: {error:?}");
                                     std::process::exit(2);

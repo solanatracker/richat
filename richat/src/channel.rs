@@ -47,6 +47,7 @@ use {
 #[derive(Debug, Clone)]
 pub struct GlobalReplayFromSlot {
     inner: Arc<Mutex<GlobalReplayFromSlotInner>>,
+    epoch: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -54,15 +55,18 @@ struct GlobalReplayFromSlotInner {
     value: Option<Slot>,
     sources_replay_failed: HashSet<&'static str>,
     sources_total: usize,
+    epoch: u64,
 }
 
 impl GlobalReplayFromSlot {
-    fn new(value: Option<Slot>, sources_total: usize) -> Self {
+    pub(crate) fn new(value: Option<Slot>, sources_total: usize) -> Self {
         Self {
+            epoch: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(GlobalReplayFromSlotInner {
                 value,
                 sources_replay_failed: HashSet::new(),
                 sources_total,
+                epoch: 0,
             })),
         }
     }
@@ -73,15 +77,40 @@ impl GlobalReplayFromSlot {
 
     pub fn store(&self, slot: Slot) {
         let mut locked = mutex_lock(&self.inner);
+        if locked.value.is_none_or(|value| slot > value) {
+            locked.sources_replay_failed.clear();
+        }
         locked.value = Some(locked.value.unwrap_or(slot).max(slot));
     }
 
-    /// Reports that a source failed to replay. Returns `true` if all sources
-    /// have now reported failure.
-    pub fn report_replay_failed(&self, source_name: &'static str) -> bool {
+    pub fn snapshot(&self) -> (Option<Slot>, u64) {
+        let locked = mutex_lock(&self.inner);
+        (locked.value, locked.epoch)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub fn fallback_to_live(
+        &self,
+        source_name: &'static str,
+        requested: Option<Slot>,
+        epoch: u64,
+    ) -> bool {
         let mut locked = mutex_lock(&self.inner);
+        if requested.is_none() || locked.value != requested || locked.epoch != epoch {
+            return false;
+        }
         locked.sources_replay_failed.insert(source_name);
-        locked.sources_replay_failed.len() >= locked.sources_total
+        if locked.sources_replay_failed.len() < locked.sources_total {
+            return false;
+        }
+        locked.value = None;
+        locked.epoch += 1;
+        self.epoch.store(locked.epoch, Ordering::Release);
+        locked.sources_replay_failed.clear();
+        true
     }
 
     /// Update sources_total and clear failed sources set.
@@ -436,6 +465,10 @@ impl Messages {
         self.get_shared(commitment).tail.load(Ordering::Relaxed)
     }
 
+    pub fn recovery_epoch(&self, commitment: CommitmentLevel) -> u64 {
+        self.get_shared(commitment).recovery_epoch()
+    }
+
     pub fn get_current_tail_with_replay(
         &self,
         commitment: CommitmentLevel,
@@ -610,6 +643,35 @@ pub struct Sender {
 }
 
 impl Sender {
+    pub fn begin_live_epoch(&mut self) -> anyhow::Result<()> {
+        let mut replay = mutex_lock(&self.replay);
+        // Commit the discontinuity before accepting any data from the live source.
+        // A restart must not recover the stale cursor from an earlier capture.
+        if let Some(storage) = &self.storage {
+            storage.begin_live_epoch(self.index)?;
+        }
+        for info in self.slots.values_mut() {
+            info.failed = true; // These slots were abandoned deliberately.
+        }
+        self.slots.clear();
+        self.dedup.clear();
+        replay.clear();
+        for sender in std::iter::once(&mut self.processed)
+            .chain(self.confirmed.iter_mut())
+            .chain(self.finalized.iter_mut())
+        {
+            sender.shared.slots_lock().clear();
+            sender
+                .shared
+                .replay_floor
+                .store(self.index, Ordering::Relaxed);
+            sender.shared.recovery_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+        update_storage_slot_metrics(&replay);
+        update_memory_slot_metrics(&self.processed.shared.slots_lock());
+        Ok(())
+    }
+
     pub fn push(&mut self, dedup_required: bool, source_name: &'static str, message: Message) {
         let slot = message.slot();
 
@@ -1152,6 +1214,7 @@ impl ReceiverSync {
 pub struct SharedChannel {
     head: AtomicU64,
     replay_floor: AtomicU64,
+    recovery_epoch: AtomicU64,
     tail: AtomicU64,
     mask: u64,
     buffer: Box<[Mutex<Item>]>,
@@ -1180,6 +1243,7 @@ impl SharedChannel {
         Self {
             head: AtomicU64::new(max_messages as u64 + 1),
             replay_floor: AtomicU64::new(0),
+            recovery_epoch: AtomicU64::new(0),
             tail: AtomicU64::new(max_messages as u64),
             mask: (max_messages - 1) as u64,
             buffer: buffer.into_boxed_slice(),
@@ -1207,6 +1271,10 @@ impl SharedChannel {
             }
         }
         Some(low)
+    }
+
+    pub fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch.load(Ordering::Relaxed)
     }
 
     #[inline]

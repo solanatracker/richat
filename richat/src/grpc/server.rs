@@ -325,6 +325,13 @@ impl GrpcServer {
             if state.finished {
                 continue;
             }
+            if state.replay_from_slot.is_some()
+                && state.recovery_epoch != self.messages.recovery_epoch(state.commitment)
+            {
+                state.finished = true;
+                client.push_error(Status::data_loss("upstream history gap interrupted replay"));
+                continue;
+            }
             let ts = Instant::now();
 
             // filter messages
@@ -529,6 +536,7 @@ impl GrpcServer {
                             let was_unset = state.filter.is_none();
                             if let Err(error) = new_filter.and_then(|filter| {
                                 let commitment = filter.commitment().into();
+                                let recovery_epoch = messages.recovery_epoch(commitment);
                                 let new_head = if state.filter.is_none()
                                     || commitment != state.commitment
                                     || subscribe_from_slot.is_some()
@@ -544,6 +552,13 @@ impl GrpcServer {
                                 } else {
                                     None
                                 };
+                                if subscribe_from_slot.is_some()
+                                    && recovery_epoch != messages.recovery_epoch(commitment)
+                                {
+                                    return Err(Status::data_loss(
+                                        "upstream history gap interrupted replay",
+                                    ));
+                                }
                                 if filter.contains_blocks()
                                     && !messages
                                         .supports_block_replay(new_head.unwrap_or(state.head))
@@ -572,6 +587,7 @@ impl GrpcServer {
                                     state.commitment = commitment;
                                     state.replay_generation = generation;
                                     state.replay_from_slot = subscribe_from_slot;
+                                    state.recovery_epoch = recovery_epoch;
                                 }
                                 state.filter = Some(filter);
                                 if was_unset {
@@ -912,6 +928,7 @@ pub struct SubscribeClientState {
     x_subscription_id: Arc<str>,
     pub commitment: CommitmentLevel,
     pub replay_generation: u64,
+    pub recovery_epoch: u64,
     pub replay_from_slot: Option<Slot>,
     pub head: IndexLocation,
     pub filter: Option<Filter>,
@@ -955,6 +972,7 @@ impl SubscribeClientState {
             x_subscription_id,
             commitment: CommitmentLevel::default(),
             replay_generation: 0,
+            recovery_epoch: 0,
             replay_from_slot: None,
             head: IndexLocation::Unknown,
             filter: None,

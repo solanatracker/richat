@@ -155,6 +155,14 @@ impl Storage {
                 ReplayQueue::drop_req(&storage.replay_queue);
                 continue;
             }
+            if state.recovery_epoch != req.messages.recovery_epoch() {
+                state.finished = true;
+                req.client
+                    .push_error(Status::data_loss("upstream history gap interrupted replay"));
+                drop(state);
+                ReplayQueue::drop_req(&storage.replay_queue);
+                continue;
+            }
             let IndexLocation::Storage(mut next_index) = state.head else {
                 unreachable!()
             };
@@ -296,11 +304,16 @@ impl Storage {
     }
 
     pub fn next_index(&self) -> u64 {
-        self.metadata
-            .catalog()
+        let catalog = self.metadata.catalog();
+        catalog
             .chunks
             .last()
             .map_or(0, |chunk| chunk.last_index + 1)
+            .max(catalog.replay_floor)
+    }
+
+    pub fn begin_live_epoch(&self, index: u64) -> anyhow::Result<()> {
+        self.metadata.set_replay_floor(index)
     }
 
     pub const fn commitment_bit(commitment: CommitmentLevel) -> u8 {
@@ -344,6 +357,7 @@ impl Storage {
         catalog
             .slots
             .iter()
+            .filter(|(_, meta)| meta.first_index >= catalog.replay_floor)
             .map(|(slot, meta)| {
                 (
                     *slot,

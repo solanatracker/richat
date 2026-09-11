@@ -8,8 +8,8 @@ use {
     },
     anyhow::Context as _,
     futures::{
-        future::try_join_all,
-        stream::{BoxStream, Stream, StreamExt, try_unfold},
+        future::{BoxFuture, try_join_all},
+        stream::{BoxStream, Stream, StreamExt},
     },
     maplit::hashmap,
     richat_client::{
@@ -66,6 +66,14 @@ pub enum ReceiveError {
     Parse(#[from] MessageParseError),
     #[error("replay from the requested slot is not available from any source")]
     ReplayFailed,
+    #[error(
+        "upstream replay unavailable from slot {from_slot}; continuing live with a history gap"
+    )]
+    ReplayGap { from_slot: Slot },
+    #[error("source stream closed")]
+    SourceClosed,
+    #[error("source subscription failed: {0}")]
+    Subscribe(String),
 }
 
 #[derive(Debug, Clone)]
@@ -119,9 +127,9 @@ fn is_grpc_replay_rejected(status: &tonic::Status) -> bool {
                 || msg.contains("failed to get replay position for slot")
         }
         // dragons mouth: broadcast from {from_slot} is not available, last available: {first_available}
-        Code::Internal => {
+        Code::Internal | Code::OutOfRange => {
             let msg = status.message();
-            msg.contains("is not available, last available")
+            msg.contains("is not available, last available") || msg == "from_slot is not supported"
         }
         // laserstream
         Code::DataLoss => true,
@@ -160,6 +168,15 @@ impl Backoff {
     }
 }
 
+type SubscribeFn = Box<
+    dyn FnMut(
+            Option<Slot>,
+        ) -> BoxFuture<
+            'static,
+            Result<kanal::AsyncReceiver<SubscriptionMessage>, SubscribeError>,
+        > + Send,
+>;
+
 type SubscriptionMessage = Result<(&'static str, Message), ReceiveError>;
 
 pub type PreparedReloadResult = anyhow::Result<(Vec<&'static str>, Vec<Subscription>)>;
@@ -183,101 +200,113 @@ impl Subscription {
         source_config: ConfigChannelSource,
         global_replay_from_slot: GlobalReplayFromSlot,
     ) -> anyhow::Result<Self> {
-        let (subscription_config, mut config) = SubscriptionConfig::new(source_config.clone());
+        let (subscription_config, config) = SubscriptionConfig::new(source_config.clone());
         let name = Self::get_static_name(&config.name);
-
-        let stream = if let Some(reconnect) = config.reconnect.take() {
-            let backoff = Backoff::new(reconnect);
-            try_unfold(
-                (
-                    backoff,
-                    subscription_config,
-                    config,
-                    global_replay_from_slot,
-                    None,
-                ),
-                move |mut state: (
-                    Backoff,
-                    SubscriptionConfig,
-                    ConfigChannelSourceGeneral,
-                    GlobalReplayFromSlot,
-                    Option<kanal::AsyncReceiver<SubscriptionMessage>>,
-                )| async move {
-                    loop {
-                        if let Some(stream) = state.4.as_mut() {
-                            match stream.recv().await {
-                                Ok(Ok((name, message))) => {
-                                    return Ok(Some(((name, message), state)));
-                                }
-                                Ok(Err(ReceiveError::ReplayFailed)) => {
-                                    if state.3.report_replay_failed(name) {
-                                        return Err(ReceiveError::ReplayFailed);
-                                    }
-                                    error!(name, "failed to replay, waiting for other sources");
-                                }
-                                Ok(Err(error)) => {
-                                    error!(name, ?error, "failed to receive")
-                                }
-                                Err(_) => {
-                                    error!(name, "stream is finished")
-                                }
-                            }
-                            state.4 = None;
-                            state.0.sleep().await;
-                        } else {
-                            match Subscription::subscribe(
-                                name,
-                                state.1.clone(),
-                                state.2.disable_accounts,
-                                state.2.parser,
-                                state.2.channel_size,
-                                state.3.load(),
-                            )
-                            .await
-                            {
-                                Ok(stream) => {
-                                    state.4 = Some(stream);
-                                    state.0.reset();
-                                }
-                                Err(error) => {
-                                    if error.is_replay_slot_not_available() {
-                                        if state.3.report_replay_failed(name) {
-                                            return Err(ReceiveError::ReplayFailed);
-                                        }
-                                        error!(name, "failed to replay at subscribe time, waiting for other sources");
-                                    } else {
-                                        error!(name, ?error, "failed to connect");
-                                    }
-                                    state.0.sleep().await;
-                                }
-                            }
-                        }
-                    }
-                },
-            )
-            .boxed()
-        } else {
-            let rx = Self::subscribe(
-                name,
-                subscription_config,
-                config.disable_accounts,
-                config.parser,
-                config.channel_size,
-                global_replay_from_slot.load(),
-            )
-            .await?;
-            futures::stream::unfold(
-                rx,
-                |rx| async move { rx.recv().await.ok().map(|msg| (msg, rx)) },
-            )
-            .boxed()
-        };
+        let stream = Self::source_stream(
+            name,
+            config.reconnect.map(Backoff::new),
+            global_replay_from_slot,
+            Box::new(move |from_slot| {
+                Box::pin(Self::subscribe(
+                    name,
+                    subscription_config.clone(),
+                    config.disable_accounts,
+                    config.parser,
+                    config.channel_size,
+                    from_slot,
+                ))
+            }),
+        );
 
         Ok(Self {
             name,
             config: source_config,
             stream,
         })
+    }
+
+    fn source_stream(
+        name: &'static str,
+        backoff: Option<Backoff>,
+        replay: GlobalReplayFromSlot,
+        subscribe: SubscribeFn,
+    ) -> BoxStream<'static, SubscriptionMessage> {
+        struct State {
+            backoff: Option<Backoff>,
+            replay: GlobalReplayFromSlot,
+            subscribe: SubscribeFn,
+            stream: Option<kanal::AsyncReceiver<SubscriptionMessage>>,
+            requested: Option<Slot>,
+            epoch: u64,
+            finished: bool,
+        }
+        let state = State {
+            backoff,
+            replay,
+            subscribe,
+            stream: None,
+            requested: None,
+            epoch: 0,
+            finished: false,
+        };
+        futures::stream::unfold(state, move |mut state| async move {
+            if state.finished { return None; }
+            loop {
+                if state.epoch != state.replay.epoch() {
+                    state.stream = None;
+                }
+                let failure = if let Some(stream) = &state.stream {
+                    let next = stream.recv().await;
+                    // Another source may have advanced recovery while this receive was pending.
+                    if state.epoch != state.replay.epoch() {
+                        state.stream = None;
+                        continue;
+                    }
+                    match next {
+                        Ok(Ok(message)) => {
+                            if let Some(backoff) = &mut state.backoff { backoff.reset(); }
+                            return Some((Ok(message), state));
+                        }
+                        Ok(Err(error)) => error,
+                        Err(_) => ReceiveError::SourceClosed,
+                    }
+                } else {
+                    (state.requested, state.epoch) = state.replay.snapshot();
+                    match (state.subscribe)(state.requested).await {
+                        Ok(stream) => { state.stream = Some(stream); continue; }
+                        Err(error) if error.is_replay_slot_not_available() => ReceiveError::ReplayFailed,
+                        Err(error) => ReceiveError::Subscribe(error.to_string()),
+                    }
+                };
+                state.stream = None;
+                if matches!(failure, ReceiveError::SourceClosed) && state.backoff.is_none() {
+                    return None;
+                }
+                if matches!(failure, ReceiveError::ReplayFailed) && let Some(from_slot) = state.requested {
+                    if state.replay.fallback_to_live(name, state.requested, state.epoch) {
+                        warn!(name, from_slot, "upstream history unavailable; skipping missing history and reconnecting live");
+                        // Yield the boundary before opening the live source so the channel can
+                        // durably invalidate replay across the gap before receiving new events.
+                        return Some((Err(ReceiveError::ReplayGap { from_slot }), state));
+                    }
+                    if state.epoch != state.replay.epoch() || state.requested != state.replay.load() {
+                        continue;
+                    }
+                    // Give the remaining sources a chance to recover the missing interval.
+                    if state.backoff.is_none() {
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                }
+                if let Some(backoff) = &mut state.backoff {
+                    error!(name, error = ?failure, "failed to receive source; reconnecting");
+                    backoff.sleep().await;
+                } else {
+                    state.finished = true;
+                    return Some((Err(failure), state));
+                }
+            }
+        }).boxed()
     }
 
     fn get_static_name(name: &str) -> &'static str {
@@ -327,7 +356,12 @@ impl Subscription {
                             .get_version()
                             .await
                             .map_err(|error| ConnectError::Grpc(error.into()))?;
-                        info!(name, version = version.version, "connected");
+                        info!(
+                            name,
+                            version = version.version,
+                            ?replay_from_slot,
+                            "connected"
+                        );
                         connection
                             .subscribe_dragons_mouth_once(Self::create_dragons_mouth_filter(
                                 disable_accounts,
@@ -346,9 +380,10 @@ impl Subscription {
                 }
             }
         };
-        info!(name, "subscribed");
+        info!(name, ?replay_from_slot, "subscribed");
 
         tokio::spawn(async move {
+            let mut received_data = false;
             loop {
                 let message = match stream.next().await {
                     Some(Ok(data)) => match Message::parse(data.into(), parser) {
@@ -363,6 +398,7 @@ impl Subscription {
                             &error,
                             richat_client::error::ReceiveError::Status(status) if is_grpc_replay_rejected(status)
                         ) {
+                            error!(name, ?replay_from_slot, %error, "upstream rejected required replay history");
                             Err(ReceiveError::ReplayFailed)
                         } else {
                             Err(error.into())
@@ -371,6 +407,15 @@ impl Subscription {
                     None => break,
                 };
 
+                if !received_data && let Ok((_, message)) = &message {
+                    received_data = true;
+                    info!(
+                        name,
+                        slot = message.slot(),
+                        ?replay_from_slot,
+                        "receiving source data"
+                    );
+                }
                 if tx.send(message).await.is_err() {
                     break;
                 }
@@ -564,5 +609,129 @@ impl Stream for Subscriptions {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yellowstone_replay_expiry_is_terminal_with_old_and_new_status_codes() {
+        for code in [Code::Internal, Code::OutOfRange] {
+            let status = tonic::Status::new(
+                code,
+                "broadcast from 446021639 is not available, last available: 446122003",
+            );
+            // Streaming failures and subscribe-time failures use the same classifier.
+            assert!(is_grpc_replay_rejected(&status));
+            assert!(SubscribeError::SubscribeGrpc(status).is_replay_slot_not_available());
+        }
+    }
+
+    #[test]
+    fn transient_replay_failures_do_not_discard_required_history() {
+        for (code, message) in [
+            (Code::Internal, "failed to get replay response"),
+            (Code::Internal, "failed to send from_slot request"),
+            (Code::Unavailable, "server is shutting down try again later"),
+            (Code::OutOfRange, "unrelated range error"),
+            (Code::InvalidArgument, "invalid account filter"),
+        ] {
+            let status = tonic::Status::new(code, message);
+            assert!(!is_grpc_replay_rejected(&status));
+            assert!(!SubscribeError::SubscribeGrpc(status).is_replay_slot_not_available());
+        }
+    }
+    #[tokio::test]
+    async fn unavailable_recovery_reconnects_live_without_forwarding_old_slot() {
+        use prost::Message as _;
+        for subscribe_time in [false, true] {
+            for reconnect in [false, true] {
+                let replay = GlobalReplayFromSlot::new(Some(446021639), 1);
+                let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+                let observed = std::sync::Arc::clone(&requests);
+                let mut source = Subscription::source_stream(
+                    "test",
+                    reconnect.then(|| {
+                        Backoff::new(ConfigChannelSourceReconnect {
+                            initial_interval: Duration::from_millis(1),
+                            max_interval: Duration::from_millis(4),
+                            multiplier: 2.0,
+                        })
+                    }),
+                    replay.clone(),
+                    Box::new(move |from_slot| {
+                        observed.lock().unwrap().push(from_slot);
+                        Box::pin(async move {
+                            if from_slot.is_some() && subscribe_time {
+                                return Err(SubscribeError::SubscribeGrpc(
+                                    tonic::Status::out_of_range(
+                                        "broadcast from 446021639 is not available, last available: 446122003",
+                                    ),
+                                ));
+                            }
+                            let (tx, rx) = kanal::unbounded_async();
+                            let event = if from_slot.is_some() {
+                                Err(ReceiveError::ReplayFailed)
+                            } else {
+                                let bytes = richat_proto::geyser::SubscribeUpdate {
+                                    created_at: Some(prost_types::Timestamp::default()),
+                                    update_oneof: Some(
+                                        richat_proto::geyser::subscribe_update::UpdateOneof::Slot(
+                                            richat_proto::geyser::SubscribeUpdateSlot {
+                                                slot: 446122100,
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }
+                                .encode_to_vec();
+                                Ok((
+                                    "test",
+                                    Message::parse(bytes.into(), MessageParserEncoding::Prost)
+                                        .unwrap(),
+                                ))
+                            };
+                            tx.send(event).await.unwrap();
+                            Ok(rx)
+                        })
+                    }),
+                );
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), source.next())
+                        .await
+                        .unwrap(),
+                    Some(Err(ReceiveError::ReplayGap {
+                        from_slot: 446021639
+                    }))
+                ));
+                assert_eq!(replay.load(), None);
+                assert_eq!(*requests.lock().unwrap(), [Some(446021639)]);
+                let (_, message) = tokio::time::timeout(Duration::from_secs(1), source.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(message.slot(), 446122100);
+                assert_eq!(*requests.lock().unwrap(), [Some(446021639), None]);
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_waits_for_other_sources_and_ignores_stale_failures() {
+        let replay = GlobalReplayFromSlot::new(Some(10), 2);
+        assert!(!replay.fallback_to_live("a", Some(10), 0));
+        assert_eq!(replay.load(), Some(10));
+        replay.store(11);
+        assert!(!replay.fallback_to_live("b", Some(10), 0));
+        assert!(!replay.fallback_to_live("b", Some(11), 0));
+        assert!(replay.fallback_to_live("a", Some(11), 0));
+        assert_eq!(replay.snapshot(), (None, 1));
+        replay.store(20);
+        assert!(!replay.fallback_to_live("b", Some(11), 0));
+        assert_eq!(replay.load(), Some(20));
     }
 }

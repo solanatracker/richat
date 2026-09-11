@@ -177,6 +177,22 @@ Richat serves downstream gRPC subscriptions locally. It consumes an upstream
 processed stream and builds its confirmed and finalized streams from slot status
 notifications. A downstream `from_slot` request is **not forwarded to Yellowstone**.
 Upstream `from_slot` is used separately for Richat's own recovery/reconnection.
+On restart, that recovery starts after the last durably finalized slot, not at
+the beginning of the retained disk window. Replaying stored history to clients
+does not rewind or open an upstream subscription. Partially captured or
+unfinalized slots may still require upstream replay to recover missing events
+and commitment changes; having some records on disk does not make a slot complete.
+
+If every configured upstream rejects the required recovery slot as unavailable,
+Richat logs the gap and reconnects to live without upstream `from_slot`. This
+applies even when automatic reconnect is not configured. The discontinuity is
+persisted before new data is accepted, and replay availability starts with the
+new capture. Old payload files remain subject to normal retention.
+
+This fallback applies only to **Richat's upstream recovery**. A client's explicit
+`from_slot` is never silently changed to live: unavailable history returns an
+error, and a replay interrupted by a new upstream gap returns `DATA_LOSS`.
+Live clients without `from_slot` stay connected and receive the resumed stream.
 
 Without `channel.config.storage`, `from_slot` works at processed, confirmed, and
 finalized commitments while the requested history is still complete in that

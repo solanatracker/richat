@@ -23,7 +23,7 @@ use {
         SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionStatus,
         subscribe_update::UpdateOneof,
     },
-    smallvec::{SmallVec, smallvec_inline},
+    smallvec::{SmallVec, smallvec},
     solana_account::ReadableAccount,
     solana_commitment_config::CommitmentLevel,
     solana_pubkey::Pubkey,
@@ -729,7 +729,7 @@ impl FilterBlocks {
             };
 
             FilteredUpdate {
-                filters: smallvec_inline![name.as_ref(); 8],
+                filters: smallvec![name.as_ref()],
                 filtered_update: FilteredUpdateType::Block {
                     message,
                     accounts,

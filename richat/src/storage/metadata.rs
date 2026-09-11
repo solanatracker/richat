@@ -219,6 +219,7 @@ pub struct MetadataMirror {
     pub segments: BTreeMap<u64, SegmentMeta>,
     pub chunks: Vec<ChunkMeta>,
     pub state: MetadataState,
+    pub replay_floor: u64,
 }
 
 impl MetadataMirror {
@@ -379,7 +380,25 @@ impl Metadata {
             segments,
             chunks,
             state,
+            replay_floor: self
+                .db
+                .get_cf(Self::cf_handle::<StateCf>(&self.db), b"replay_floor")?
+                .map(|value| decode_u64_key(&value))
+                .transpose()?
+                .unwrap_or(0),
         })
+    }
+
+    pub fn set_replay_floor(&self, index: u64) -> anyhow::Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put_cf(
+            Self::cf_handle::<StateCf>(&self.db),
+            b"replay_floor",
+            index.to_be_bytes(),
+        );
+        self.write_batch(batch)?;
+        self.catalog.write().expect("poisoned").replay_floor = index;
+        Ok(())
     }
 
     fn read_state(&self) -> anyhow::Result<Option<MetadataState>> {
