@@ -12,6 +12,23 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Fixes
 
+### Features
+
+### Breaking
+
+## 2026-10-21
+
+- richat-cli-v12.0.0
+- richat-client-v11.0.0
+- richat-filter-v11.0.0
+- richat-metrics-v2.0.0
+- richat-plugin-agave-v11.0.0
+- richat-proto-v11.0.0
+- richat-v13.0.0
+- richat-shared-v11.0.0
+
+### Fixes
+
 - richat, plugin-agave: gRPC servers accept and send `gzip` / `zstd` by default, like Yellowstone gRPC. Before, a client asking for compressed responses received uncompressed data, and a client sending compressed requests was rejected with `Unimplemented`. Set `compression.accept` / `compression.send` to `[]` to disable; gRPC clients (sources) still default to no compression.
 - plugin-agave: parse the plugin config as JSON5 so the shipped `config.json` with `//` comments loads in both the validator and `richat-plugin-agave-config-check`; add a unit test that loads it.
 - richat: when upstream recovery history is unavailable, reconnect live without `from_slot` instead of retrying the stale cursor; recognize Yellowstone's `OUT_OF_RANGE` response and reset backoff only after receiving source data.
@@ -58,6 +75,7 @@ The minor version will be incremented upon a breaking change and the patch versi
 - plugin-agave: every `notifications` option (`deshred_transactions`, `deshred_transactions_alt_resolution`, `contact_info`, `block_footers`) is enabled by default, like Yellowstone gRPC; set them to `false` to keep the previous behaviour. Richat stream clients still receive these messages only when they enable them in `RichatFilter`.
 - plugin-agave, filter, proto: `bank_id` arguments / fields on `ProtobufMessage`, encoders and `Message*` types; `SubscribeRequest` has new `block_footer` field and `SubscribeRequestFilterEntry` has `include_update_parent`.
 - filter: `FilteredUpdate::encode` takes `&mut Vec<u8>` instead of `impl BufMut`.
+- metrics: `ConfigMetrics` has a new `max_subscription_ids` field.
 - richat: new disk chunks record commitment streams and blocks. Old processed-only chunks remain readable, but new chunks cannot be read by older binaries.
 
 ## 2026-09-10
