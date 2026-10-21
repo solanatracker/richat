@@ -13,7 +13,7 @@ The minor version will be incremented upon a breaking change and the patch versi
 ### Fixes
 
 - richat, plugin-agave: gRPC servers accept and send `gzip` / `zstd` by default, like Yellowstone gRPC. Before, a client asking for compressed responses received uncompressed data, and a client sending compressed requests was rejected with `Unimplemented`. Set `compression.accept` / `compression.send` to `[]` to disable; gRPC clients (sources) still default to no compression.
-
+- plugin-agave: parse the plugin config as JSON5 so the shipped `config.json` with `//` comments loads in both the validator and `richat-plugin-agave-config-check`; add a unit test that loads it.
 - richat: when upstream recovery history is unavailable, reconnect live without `from_slot` instead of retrying the stale cursor; recognize Yellowstone's `OUT_OF_RANGE` response and reset backoff only after receiving source data.
 - richat: persist recovery gaps and keep explicit client replay strict: unavailable history errors instead of silently falling back to live.
 - filter: emit each matching block filter name once instead of eight times.

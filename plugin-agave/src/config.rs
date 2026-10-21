@@ -29,8 +29,9 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parses JSON with comments (JSON5), same as the Agave plugin manager does for `libpath`.
     fn load_from_str(config: &str) -> PluginResult<Self> {
-        serde_json::from_str(config).map_err(|error| GeyserPluginError::ConfigFileReadError {
+        json5::from_str(config).map_err(|error| GeyserPluginError::ConfigFileReadError {
             msg: error.to_string(),
         })
     }
@@ -119,5 +120,38 @@ impl ConfigChannel {
                 "failed to decode encoder: {value}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_is_valid() {
+        let config = Config::load_from_file(concat!(env!("CARGO_MANIFEST_DIR"), "/config.json"))
+            .expect("shipped config.json must be loadable");
+        assert_eq!(config.channel.max_messages, 2_097_152);
+        assert_eq!(config.channel.max_bytes, 16 * 1024 * 1024 * 1024);
+        assert!(config.grpc.is_none());
+        assert!(config.quic.is_none());
+    }
+
+    #[test]
+    fn config_with_comments() {
+        let config = Config::load_from_str(
+            r#"{
+                // line comment
+                "libpath": "lib.so", /* block comment */
+                "tokio": { "worker_threads": null }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.libpath, "lib.so");
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        assert!(Config::load_from_str(r#"{ "unknown": 1 }"#).is_err());
     }
 }

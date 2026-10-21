@@ -24,6 +24,7 @@ anyhow = { workspace = true }
 bincode = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 futures = { workspace = true }
+json5 = { workspace = true }
 log = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 prost = { workspace = true }
@@ -33,7 +34,6 @@ richat-proto = { workspace = true }
 richat-shared = { workspace = true, features = ["transports", "version"] }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 smallvec = { workspace = true }
 solana-account-decoder = { workspace = true }
 solana-clock = { workspace = true }
