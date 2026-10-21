@@ -1,5 +1,5 @@
 use {
-    crate::config::ConfigMetrics,
+    crate::{config::ConfigMetrics, labels::set_subscription_ids_max},
     http_body_util::{BodyExt, Full as BodyFull},
     hyper::{
         Request, Response, StatusCode,
@@ -16,12 +16,16 @@ use {
 };
 
 pub async fn spawn_server(
-    ConfigMetrics { endpoint }: ConfigMetrics,
+    ConfigMetrics {
+        endpoint,
+        max_subscription_ids,
+    }: ConfigMetrics,
     gather_metrics: impl Fn() -> Vec<u8> + Clone + Send + 'static,
     is_health_check: impl Fn() -> bool + Clone + Send + 'static,
     is_ready_check: impl Fn() -> bool + Clone + Send + 'static,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<impl Future<Output = Result<(), JoinError>>> {
+    set_subscription_ids_max(max_subscription_ids);
     let listener = TcpListener::bind(endpoint).await?;
     info!("start server at: {endpoint}");
 

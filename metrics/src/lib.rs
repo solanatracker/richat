@@ -3,6 +3,12 @@ pub use ::metrics::*;
 mod config;
 pub use config::ConfigMetrics;
 
+mod labels;
+pub use labels::{
+    SUBSCRIPTION_ID_MAX_LEN, SUBSCRIPTION_ID_OTHER, SUBSCRIPTION_IDS_MAX_DEFAULT,
+    set_subscription_ids_max, subscription_id_label,
+};
+
 mod macros;
 
 mod recorder;

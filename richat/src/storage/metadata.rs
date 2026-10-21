@@ -274,6 +274,13 @@ impl Metadata {
         options.create_if_missing(true);
         options.create_missing_column_families(true);
         options.set_compression_type(DBCompressionType::None);
+        // chunks are committed with synced writes while the `slots` CF gets a few small puts
+        // per second: without a cap its memtable pins WAL files for days (default limit is
+        // ~4x the write buffers, ~2GiB) and restart replays all of them
+        options.set_max_total_wal_size(64 * 1024 * 1024);
+        // the info LOG is never rotated by default
+        options.set_max_log_file_size(16 * 1024 * 1024);
+        options.set_keep_log_file_num(4);
         options
     }
 

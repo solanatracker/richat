@@ -337,6 +337,7 @@ impl Harness {
             ConfigChannelInner {
                 max_messages,
                 max_bytes: 1_000_000,
+                max_unfinalized_slots: 1_024,
                 storage,
             },
             false,
@@ -661,6 +662,7 @@ fn no_storage_replays_all_commitments_from_local_memory() {
         ConfigChannelInner {
             max_messages: 128,
             max_bytes: 1_000_000,
+            max_unfinalized_slots: 1_024,
             storage: None,
         },
         false,
@@ -1749,3 +1751,6 @@ async fn yellowstone_client_receives_requested_compression_by_default() {
             .unwrap();
     }
 }
+
+#[path = "channel_bounds_tests.rs"]
+mod bounds_tests;

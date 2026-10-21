@@ -28,6 +28,7 @@ use {
     },
     solana_clock::Slot,
     std::{
+        borrow::Cow,
         collections::{HashMap, HashSet},
         fmt,
         pin::Pin,
@@ -74,6 +75,8 @@ pub enum ReceiveError {
     SourceClosed,
     #[error("source subscription failed: {0}")]
     Subscribe(String),
+    #[error("source sent nothing for {0:?}")]
+    Idle(Duration),
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +205,10 @@ impl Subscription {
     ) -> anyhow::Result<Self> {
         let (subscription_config, config) = SubscriptionConfig::new(source_config.clone());
         let name = Self::get_static_name(&config.name);
+        let idle_timeout = config
+            .reconnect
+            .as_ref()
+            .and_then(|reconnect| reconnect.idle_timeout);
         let stream = Self::source_stream(
             name,
             config.reconnect.map(Backoff::new),
@@ -213,6 +220,7 @@ impl Subscription {
                     config.disable_accounts,
                     config.parser,
                     config.channel_size,
+                    idle_timeout,
                     from_slot,
                 ))
             }),
@@ -289,10 +297,16 @@ impl Subscription {
                         // durably invalidate replay across the gap before receiving new events.
                         return Some((Err(ReceiveError::ReplayGap { from_slot }), state));
                     }
+                    // Retry with the updated replay slot, or give the remaining sources a chance
+                    // to recover the missing interval; never redial an upstream that keeps
+                    // rejecting history in a tight loop.
                     if state.epoch != state.replay.epoch() || state.requested != state.replay.load() {
+                        match &mut state.backoff {
+                            Some(backoff) => backoff.sleep().await,
+                            None => sleep(Duration::from_millis(100)).await,
+                        }
                         continue;
                     }
-                    // Give the remaining sources a chance to recover the missing interval.
                     if state.backoff.is_none() {
                         sleep(Duration::from_millis(100)).await;
                         continue;
@@ -328,11 +342,12 @@ impl Subscription {
         disable_accounts: bool,
         parser: MessageParserEncoding,
         channel_size: usize,
+        idle_timeout: Option<Duration>,
         replay_from_slot: Option<Slot>,
     ) -> Result<kanal::AsyncReceiver<SubscriptionMessage>, SubscribeError> {
         let (tx, rx) = kanal::bounded_async(channel_size);
 
-        let mut stream = match config {
+        let stream = match config {
             SubscriptionConfig::Quic { config } => {
                 let connection = config.connect().await.map_err(ConnectError::Quic)?;
                 let filter = Self::create_richat_filter(disable_accounts);
@@ -382,47 +397,77 @@ impl Subscription {
         };
         info!(name, ?replay_from_slot, "subscribed");
 
-        tokio::spawn(async move {
-            let mut received_data = false;
-            loop {
-                let message = match stream.next().await {
-                    Some(Ok(data)) => match Message::parse(data.into(), parser) {
-                        Ok(message) => Ok((name, message)),
-                        Err(MessageParseError::InvalidUpdateMessage("Ping" | "Richat")) => {
-                            continue;
-                        }
-                        Err(error) => Err(error.into()),
-                    },
-                    Some(Err(error)) => {
-                        if matches!(
-                            &error,
-                            richat_client::error::ReceiveError::Status(status) if is_grpc_replay_rejected(status)
-                        ) {
-                            error!(name, ?replay_from_slot, %error, "upstream rejected required replay history");
-                            Err(ReceiveError::ReplayFailed)
-                        } else {
-                            Err(error.into())
-                        }
-                    }
-                    None => break,
-                };
-
-                if !received_data && let Ok((_, message)) = &message {
-                    received_data = true;
-                    info!(
-                        name,
-                        slot = message.slot(),
-                        ?replay_from_slot,
-                        "receiving source data"
-                    );
-                }
-                if tx.send(message).await.is_err() {
-                    break;
-                }
-            }
-        });
+        tokio::spawn(Self::forward(
+            name,
+            stream,
+            tx,
+            parser,
+            idle_timeout,
+            replay_from_slot,
+        ));
 
         Ok(rx)
+    }
+
+    /// Parses upstream updates into the source channel until the upstream, or the channel, ends
+    async fn forward<D: Into<Cow<'static, [u8]>>>(
+        name: &'static str,
+        mut stream: BoxStream<'static, Result<D, richat_client::error::ReceiveError>>,
+        tx: kanal::AsyncSender<SubscriptionMessage>,
+        parser: MessageParserEncoding,
+        idle_timeout: Option<Duration>,
+        replay_from_slot: Option<Slot>,
+    ) {
+        let mut received_data = false;
+        loop {
+            // a connection can stay alive while the upstream is stuck, only reconnect helps
+            let next = match idle_timeout {
+                Some(idle_timeout) => match tokio::time::timeout(idle_timeout, stream.next()).await
+                {
+                    Ok(next) => next,
+                    Err(_elapsed) => {
+                        warn!(name, ?idle_timeout, "source is idle; reconnecting");
+                        let _ = tx.send(Err(ReceiveError::Idle(idle_timeout))).await;
+                        break;
+                    }
+                },
+                None => stream.next().await,
+            };
+            let message = match next {
+                Some(Ok(data)) => match Message::parse(data.into(), parser) {
+                    Ok(message) => Ok((name, message)),
+                    Err(MessageParseError::InvalidUpdateMessage("Ping" | "Richat")) => {
+                        continue;
+                    }
+                    Err(error) => Err(error.into()),
+                },
+                Some(Err(error)) => {
+                    if matches!(
+                        &error,
+                        richat_client::error::ReceiveError::Status(status) if is_grpc_replay_rejected(status)
+                    ) {
+                        error!(name, ?replay_from_slot, %error, "upstream rejected required replay history");
+                        Err(ReceiveError::ReplayFailed)
+                    } else {
+                        Err(error.into())
+                    }
+                }
+                None => break,
+            };
+
+            if !received_data && let Ok((_, message)) = &message {
+                received_data = true;
+                info!(
+                    name,
+                    slot = message.slot(),
+                    ?replay_from_slot,
+                    "receiving source data"
+                );
+            }
+            if tx.send(message).await.is_err() {
+                break;
+            }
+        }
     }
 
     const fn create_richat_filter(disable_accounts: bool) -> Option<RichatFilter> {
@@ -622,6 +667,33 @@ impl Stream for Subscriptions {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn silent_upstream_is_reported_idle_and_dropped() {
+        let (tx, rx) = kanal::bounded_async(16);
+        let stream =
+            futures::stream::pending::<Result<Vec<u8>, richat_client::error::ReceiveError>>()
+                .boxed();
+        let task = tokio::spawn(Subscription::forward(
+            "test",
+            stream,
+            tx,
+            MessageParserEncoding::Prost,
+            Some(Duration::from_millis(50)),
+            None,
+        ));
+        let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("idle timeout fired")
+            .expect("sender alive");
+        assert!(matches!(message, Err(ReceiveError::Idle(_))));
+        // the task ends and drops the upstream stream, the reconnect path opens a new one
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("forward task finished")
+            .unwrap();
+        assert!(rx.recv().await.is_err());
+    }
+
     #[test]
     fn yellowstone_replay_expiry_is_terminal_with_old_and_new_status_codes() {
         for code in [Code::Internal, Code::OutOfRange] {
@@ -664,6 +736,7 @@ mod tests {
                             initial_interval: Duration::from_millis(1),
                             max_interval: Duration::from_millis(4),
                             multiplier: 2.0,
+                            idle_timeout: None,
                         })
                     }),
                     replay.clone(),

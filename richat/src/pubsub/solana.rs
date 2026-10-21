@@ -1,8 +1,5 @@
 use {
-    crate::{
-        channel::ParsedMessage,
-        pubsub::{SubscriptionId, filter::TransactionFilter},
-    },
+    crate::pubsub::{SubscriptionId, filter::TransactionFilter},
     arrayvec::ArrayVec,
     jsonrpsee_types::{
         ErrorCode, ErrorObject, ErrorObjectOwned, Extensions, Id, Params, Request, Response,
@@ -94,17 +91,8 @@ pub enum SubscribeMethod {
 }
 
 impl SubscribeMethod {
-    pub const fn get_message_methods(message: &ParsedMessage) -> &[Self] {
-        match message {
-            ParsedMessage::Slot(_) => &[Self::Slot, Self::SlotsUpdates, Self::Root],
-            ParsedMessage::Account(_) => &[Self::Account, Self::Program],
-            ParsedMessage::Transaction(_) => &[Self::Logs, Self::Signature, Self::Transaction],
-            ParsedMessage::Entry(_) => &[],
-            ParsedMessage::BlockMeta(_) => &[],
-            ParsedMessage::Block(_) => &[Self::Block],
-            ParsedMessage::BlockFooter(_) | ParsedMessage::EntryUpdateParent(_) => &[],
-        }
-    }
+    /// Number of variants, for arrays indexed by `method as usize`.
+    pub const COUNT: usize = 9;
 
     pub const fn as_str(self) -> &'static str {
         match self {

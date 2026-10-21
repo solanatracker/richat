@@ -25,6 +25,8 @@ pub const CHANNEL_EVENTS_RECEIVED: &str = "channel_events_received"; // source, 
 pub const CHANNEL_SLOT: &str = "channel_slot"; // commitment
 pub const CHANNEL_MESSAGES_TOTAL: &str = "channel_messages_total";
 pub const CHANNEL_SLOTS_TOTAL: &str = "channel_slots_total";
+pub const CHANNEL_UNFINALIZED_SLOTS_TOTAL: &str = "channel_unfinalized_slots_total";
+pub const CHANNEL_UNFINALIZED_SLOTS_DROPPED_TOTAL: &str = "channel_unfinalized_slots_dropped_total";
 pub const CHANNEL_BYTES_TOTAL: &str = "channel_bytes_total";
 pub const CHANNEL_MEMORY_FIRST_SLOT: &str = "channel_memory_first_slot";
 pub const CHANNEL_MEMORY_LAST_SLOT: &str = "channel_memory_last_slot";
@@ -94,6 +96,8 @@ pub fn setup() -> Result<PrometheusHandle, BuildError> {
     describe_gauge!(CHANNEL_SLOT, "Latest slot in channel by commitment");
     describe_gauge!(CHANNEL_MESSAGES_TOTAL, "Total number of messages in channel");
     describe_gauge!(CHANNEL_SLOTS_TOTAL, "Total number of slots in channel");
+    describe_gauge!(CHANNEL_UNFINALIZED_SLOTS_TOTAL, "Number of not finalized slots kept for confirmed / finalized streams");
+    describe_counter!(CHANNEL_UNFINALIZED_SLOTS_DROPPED_TOTAL, "Not finalized slots dropped because finalized stalled");
     describe_gauge!(CHANNEL_BYTES_TOTAL, "Total size of all messages in channel");
     describe_gauge!(CHANNEL_MEMORY_FIRST_SLOT, "Oldest slot currently retained in the processed in-memory channel; -1 when empty");
     describe_gauge!(CHANNEL_MEMORY_LAST_SLOT, "Newest slot currently retained in the processed in-memory channel; -1 when empty");

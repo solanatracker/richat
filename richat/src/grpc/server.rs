@@ -23,7 +23,7 @@ use {
         filter::Filter,
         message::MessageRef,
     },
-    richat_metrics::duration_to_seconds,
+    richat_metrics::{duration_to_seconds, subscription_id_label},
     richat_proto::{
         geyser::{
             CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
@@ -204,12 +204,15 @@ impl GrpcServer {
         service
     }
 
-    fn get_x_subscription_id<T>(request: &Request<T>) -> String {
-        request
-            .metadata()
-            .get(X_SUBSCRIPTION_ID)
-            .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
-            .unwrap_or_default()
+    /// Bounded metrics label, see [`subscription_id_label`]
+    fn get_x_subscription_id<T>(request: &Request<T>) -> Arc<str> {
+        subscription_id_label(
+            request
+                .metadata()
+                .get(X_SUBSCRIPTION_ID)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default(),
+        )
     }
 
     fn parse_commitment(commitment: Option<i32>) -> Result<CommitmentLevelProto, Status> {
@@ -457,7 +460,7 @@ impl GrpcServer {
         + Send
         + 'static,
     ) -> TonicResult<Response<ReceiverStream>> {
-        let x_subscription_id: Arc<str> = Self::get_x_subscription_id(&request).into();
+        let x_subscription_id = Self::get_x_subscription_id(&request);
         counter!(
             metrics::GRPC_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
@@ -536,7 +539,13 @@ impl GrpcServer {
                 let mut filter_ever_set = false;
                 let mut handshake_abandoned = false;
                 loop {
-                    match stream.message().await {
+                    let message = tokio::select! {
+                        message = stream.message() => message,
+                        // nothing sends responses anymore, dropping `stream` resets the
+                        // HTTP/2 stream and releases the client
+                        () = client.finished() => break,
+                    };
+                    match message {
                         Ok(Some(message)) => {
                             if let Some(id) = get_ping(&message) {
                                 let data = SubscribeClientState::create_pong(id);
@@ -933,6 +942,13 @@ impl SubscribeClient {
     pub fn wake(&self) {
         self.waker.wake();
     }
+
+    /// Resolves once the client is finished: an error was sent or the response stream dropped
+    async fn finished(&self) {
+        while !self.state_lock().finished {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1193,5 +1209,30 @@ impl GrpcServer {
         let worker = service.clone();
         let thread = std::thread::spawn(move || worker.worker_messages(0, 128, 100, 100, shutdown));
         (service, thread)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{ReceiverStream, SubscribeClient},
+        futures::FutureExt,
+        std::{sync::Arc, time::Duration},
+    };
+
+    #[tokio::test]
+    async fn request_reader_stops_when_response_stream_is_dropped() {
+        let client = SubscribeClient::new(1, 1024, 1024, Arc::from("test"));
+        let response = ReceiverStream::new(client.clone());
+        let mut finished = Box::pin(client.finished());
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!((&mut finished).now_or_never().is_none());
+
+        // the response ends (lagged, error) or the client goes away, the request stream can
+        // stay open, the reader must not keep the client and its metrics alive
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(2), finished)
+            .await
+            .expect("request reader is not released");
     }
 }

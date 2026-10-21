@@ -3,6 +3,7 @@ logs:
   json: false
 metrics:
   endpoint: 127.0.0.1:10124
+  max_subscription_ids: 1024 # distinct `x_subscription_id` label values, the rest is reported as `other`
 channel:
   tokio:
     worker_threads: null # by default number of cpus
@@ -43,6 +44,7 @@ channel:
     #     initial_interval: 1s
     #     max_interval: 30s
     #     multiplier: 2
+    #     idle_timeout: 30s # reconnect when the upstream sends nothing, null to disable
     #   channel_size: 16384
     #   transport: quic
     #   endpoint: 127.0.0.1:10101
@@ -59,6 +61,7 @@ channel:
   config:
     max_messages: 2_097_152
     max_bytes: 16GiB
+    max_unfinalized_slots: 1024 # not finalized slots kept when finalized stalls, older are dropped
     # storage:
       # Root directory for replay storage. Metadata RocksDB is stored at
       # <path>/metadata and segment files at <path>/segments.

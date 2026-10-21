@@ -3,7 +3,7 @@ use {
         metrics,
         pubsub::{SubscriptionId, solana::SubscribeMethod},
     },
-    ::metrics::gauge,
+    ::metrics::{Gauge, gauge},
     agave_reserved_account_keys::ReservedAccountKeys,
     jsonrpsee_types::{Extensions, SubscriptionPayload, SubscriptionResponse, TwoPointZero},
     richat_filter::message::{MessageBlock, MessageTransaction},
@@ -26,7 +26,7 @@ use {
         collections::VecDeque,
         sync::{Arc, Weak},
     },
-    tokio::sync::broadcast,
+    tokio::sync::mpsc,
 };
 
 #[derive(Debug, Clone)]
@@ -75,57 +75,85 @@ impl RpcNotification {
     }
 }
 
+/// Item of the bounded per-client queue filled by the subscriptions tracker.
+#[derive(Debug)]
+pub enum ClientNotification {
+    Notification(RpcNotification),
+    /// The queue was full: the tracker dropped the client and sends nothing more.
+    Lagged,
+}
+
+/// Sender side of the per-client queue, only the subscriptions tracker owns it.
+///
+/// The channel is created with one extra slot, reserved for [`ClientNotification::Lagged`], so
+/// the tracker can always tell the client why it was dropped without waiting for it.
+#[derive(Debug)]
+pub struct ClientSender {
+    tx: mpsc::Sender<ClientNotification>,
+}
+
+impl ClientSender {
+    pub fn channel(max_count: usize) -> (Self, mpsc::Receiver<ClientNotification>) {
+        let capacity = max_count.clamp(1, tokio::sync::Semaphore::MAX_PERMITS - 1) + 1;
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    /// Never blocks. Returns `false` if the client is lagged (queue full) and must be dropped.
+    pub fn send(&self, notification: RpcNotification) -> bool {
+        // the tracker is the only sender, so capacity can't shrink between the check and the send
+        if self.tx.capacity() <= 1 {
+            let _ = self.tx.try_send(ClientNotification::Lagged);
+            return false;
+        }
+        // `Closed` means the client is gone, `ClientRequest::Remove` follows
+        let _ = self
+            .tx
+            .try_send(ClientNotification::Notification(notification));
+        true
+    }
+}
+
+/// Keeps the latest notifications alive; clients get `Weak` references, a client that reads a
+/// notification already evicted from here is lagged.
 #[derive(Debug)]
 pub struct RpcNotifications {
     items: VecDeque<Arc<String>>,
     bytes_total: usize,
     max_count: usize,
     max_bytes: usize,
-    sender: broadcast::Sender<RpcNotification>,
+    gauge_count: Gauge,
+    gauge_bytes: Gauge,
 }
 
 impl RpcNotifications {
-    pub fn new(
-        max_count: usize,
-        max_bytes: usize,
-        sender: broadcast::Sender<RpcNotification>,
-    ) -> Self {
+    pub fn new(max_count: usize, max_bytes: usize) -> Self {
         Self {
             items: VecDeque::with_capacity(max_count + 1),
             bytes_total: 0,
             max_count,
             max_bytes,
-            sender,
+            gauge_count: gauge!(metrics::PUBSUB_STORED_MESSAGES_COUNT_TOTAL),
+            gauge_bytes: gauge!(metrics::PUBSUB_STORED_MESSAGES_BYTES_TOTAL),
         }
     }
 
-    pub fn push(
-        &mut self,
-        subscription_id: SubscriptionId,
-        method: SubscribeMethod,
-        is_final: bool,
-        json: Arc<String>,
-    ) {
-        let notification = RpcNotification {
-            subscription_id,
-            method,
-            is_final,
-            json: Arc::downgrade(&json),
-        };
-        let _ = self.sender.send(notification);
+    pub fn push(&mut self, json: Arc<String>) -> Weak<String> {
+        let weak = Arc::downgrade(&json);
 
         self.bytes_total += json.len();
         while self.bytes_total >= self.max_bytes || self.items.len() >= self.max_count {
-            let item = self
-                .items
-                .pop_front()
-                .expect("RpcNotifications item should exists");
+            let Some(item) = self.items.pop_front() else {
+                break;
+            };
             self.bytes_total -= item.len();
         }
         self.items.push_back(json);
 
-        gauge!(metrics::PUBSUB_STORED_MESSAGES_COUNT_TOTAL).set(self.items.len() as f64);
-        gauge!(metrics::PUBSUB_STORED_MESSAGES_BYTES_TOTAL).set(self.bytes_total as f64);
+        self.gauge_count.set(self.items.len() as f64);
+        self.gauge_bytes.set(self.bytes_total as f64);
+
+        weak
     }
 }
 

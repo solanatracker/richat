@@ -186,6 +186,12 @@ pub struct ConfigChannelSourceReconnect {
     pub max_interval: Duration,
     #[serde(default = "ConfigChannelSourceReconnect::default_multiplier")]
     pub multiplier: f64,
+    /// Reconnect when the upstream sends nothing (data or ping) for this long, `null` to disable
+    #[serde(
+        with = "humantime_serde",
+        default = "ConfigChannelSourceReconnect::default_idle_timeout"
+    )]
+    pub idle_timeout: Option<Duration>,
 }
 
 impl ConfigChannelSourceReconnect {
@@ -199,6 +205,10 @@ impl ConfigChannelSourceReconnect {
 
     const fn default_multiplier() -> f64 {
         2.0
+    }
+
+    const fn default_idle_timeout() -> Option<Duration> {
+        Some(Duration::from_secs(30))
     }
 }
 
@@ -217,6 +227,10 @@ pub struct ConfigChannelInner {
     pub max_messages: usize,
     #[serde(deserialize_with = "deserialize_humansize_usize")]
     pub max_bytes: usize,
+    /// Max not finalized slots kept for confirmed / finalized streams and blocks, older slots
+    /// are dropped when finalized stalls (or a source never sends it)
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub max_unfinalized_slots: usize,
     pub storage: Option<ConfigStorage>,
 }
 
@@ -225,6 +239,7 @@ impl Default for ConfigChannelInner {
         Self {
             max_messages: 2_097_152, // aligned to power of 2, ~20k/slot should give us ~100 slots
             max_bytes: 15 * 1024 * 1024 * 1024, // 15GiB with ~150MiB/slot should give us ~100 slots
+            max_unfinalized_slots: 1_024, // ~7 minutes of finalized stall with 400ms slots
             storage: None,
         }
     }

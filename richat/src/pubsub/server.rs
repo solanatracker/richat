@@ -6,13 +6,13 @@ use {
         pubsub::{
             ClientId, SubscriptionId,
             config::ConfigAppsPubsub,
-            notification::{RpcNotification, RpcNotifications},
+            notification::{ClientNotification, ClientSender, RpcNotifications},
             solana::{SubscribeConfig, SubscribeMessage, SubscribeMethod},
             tracker::{ClientRequest, subscriptions_worker},
         },
         version::VERSION,
     },
-    ::metrics::{counter, gauge},
+    ::metrics::{Counter, Gauge, counter, gauge},
     fastwebsockets::{
         CloseCode, FragmentCollectorRead, Frame, OpCode, Payload, WebSocketError,
         upgrade::{UpgradeFut, is_upgrade_request, upgrade},
@@ -27,13 +27,14 @@ use {
     jsonrpsee_types::{
         ErrorCode, ErrorObject, ErrorObjectOwned, Extensions, ResponsePayload, TwoPointZero,
     },
+    richat_metrics::subscription_id_label,
     richat_shared::jsonrpc::helpers::get_x_subscription_id,
     solana_nohash_hasher::IntMap,
     solana_rpc_client_api::response::RpcVersionInfo,
     std::{future::Future, net::TcpListener as StdTcpListener, sync::Arc},
     tokio::{
         net::TcpListener,
-        sync::{broadcast, oneshot},
+        sync::{mpsc, oneshot},
     },
     tokio_rustls::TlsAcceptor,
     tokio_util::sync::CancellationToken,
@@ -64,15 +65,13 @@ impl PubSubServer {
         // Clients requests channel
         let (clients_tx, clients_rx) = kanal::bounded_async(config.clients_requests_channel_size);
 
-        // Spawn subscription channel
-        let (notifications, _) = broadcast::channel(config.notifications_messages_max_count);
+        // Spawn subscriptions tracker
         let subscriptions_jh = ConfigAppsWorkers::run_once(
             0,
             "richatPSubWrk".to_owned(),
             config.subscriptions_worker_affinity.take(),
             {
                 let subscriptions_workers_affinity = config.subscriptions_workers_affinity.take();
-                let notifications = notifications.clone();
                 move |_index| {
                     subscriptions_worker(
                         messages,
@@ -84,7 +83,6 @@ impl PubSubServer {
                         RpcNotifications::new(
                             config.notifications_messages_max_count,
                             config.notifications_messages_max_bytes,
-                            notifications,
                         ),
                         config.signatures_cache_max,
                         config.signatures_cache_slots_max,
@@ -121,16 +119,16 @@ impl PubSubServer {
                 let recv_max_message_size = config.recv_max_message_size;
                 let enable_block_subscription = config.enable_block_subscription;
                 let enable_transaction_subscription = config.enable_transaction_subscription;
+                let notifications_max_count = config.notifications_messages_max_count;
                 let service = service_fn({
                     let clients_tx = clients_tx.clone();
-                    let notifications = notifications.clone();
                     let shutdown = shutdown.clone();
                     move |req: Request<BodyIncoming>| {
                         let clients_tx = clients_tx.clone();
-                        let notifications = notifications.subscribe();
                         let shutdown = shutdown.clone();
                         async move {
-                            let x_subscription_id: Arc<str> = get_x_subscription_id(req.headers());
+                            let x_subscription_id =
+                                subscription_id_label(&get_x_subscription_id(req.headers()));
                             let connections_total = gauge!(
                                 metrics::PUBSUB_CONNECTIONS_TOTAL,
                                 "x_subscription_id" => Arc::clone(&x_subscription_id),
@@ -148,8 +146,8 @@ impl PubSubServer {
                                                 recv_max_message_size,
                                                 enable_block_subscription,
                                                 enable_transaction_subscription,
+                                                notifications_max_count,
                                                 clients_tx,
-                                                notifications,
                                                 shutdown,
                                             )
                                             .await
@@ -177,7 +175,6 @@ impl PubSubServer {
                 });
 
                 let acceptor = acceptor.clone();
-                let clients_tx = clients_tx.clone();
                 tokio::spawn(async move {
                     let builder = ServerBuilder::new(TokioExecutor::new());
                     let served_result = if let Some(acceptor) = acceptor {
@@ -195,10 +192,11 @@ impl PubSubServer {
                             .await
                     };
 
+                    // with an upgrade this resolves once the connection is handed to the
+                    // websocket, the client is removed when the websocket task ends
                     if let Err(error) = served_result {
                         error!("Error serving HTTP connection: {error:?}");
                     }
-                    let _ = clients_tx.send(ClientRequest::Remove { client_id }).await;
                 });
 
                 client_id += 1;
@@ -221,8 +219,45 @@ impl PubSubServer {
         recv_max_message_size: usize,
         enable_block_subscription: bool,
         enable_transaction_subscription: bool,
+        notifications_max_count: usize,
         clients_tx: kanal::AsyncSender<ClientRequest>,
-        mut notifications: broadcast::Receiver<RpcNotification>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let (sender, notifications) = ClientSender::channel(notifications_max_count);
+        if clients_tx
+            .send(ClientRequest::Register { client_id, sender })
+            .await
+            .is_err()
+        {
+            return Ok(()); // means shutdown
+        }
+
+        let result = Self::serve_client(
+            client_id,
+            x_subscription_id,
+            ws_fut,
+            recv_max_message_size,
+            enable_block_subscription,
+            enable_transaction_subscription,
+            clients_tx.clone(),
+            notifications,
+            shutdown,
+        )
+        .await;
+        let _ = clients_tx.send(ClientRequest::Remove { client_id }).await;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_client(
+        client_id: ClientId,
+        x_subscription_id: Arc<str>,
+        ws_fut: UpgradeFut,
+        recv_max_message_size: usize,
+        enable_block_subscription: bool,
+        enable_transaction_subscription: bool,
+        clients_tx: kanal::AsyncSender<ClientRequest>,
+        mut notifications: mpsc::Receiver<ClientNotification>,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         let mut ws = ws_fut.await?;
@@ -298,6 +333,7 @@ impl PubSubServer {
 
         let write_fut = tokio::spawn(async move {
             let mut subscriptions = IntMap::<SubscriptionId, SubscribeMethod>::default();
+            let mut metrics = ClientMetrics::new(x_subscription_id);
             let maybe_close_reason = loop {
                 tokio::select! {
                     message = read_rx.recv() => match message {
@@ -328,12 +364,7 @@ impl PubSubServer {
                                     let removed = rx.await?;
                                     if removed {
                                         if let Some(method) = subscriptions.remove(&id) {
-                                            gauge!(
-                                                metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
-                                                "x_subscription_id" => Arc::clone(&x_subscription_id),
-                                                "method" => method.as_str()
-                                            )
-                                            .decrement(1);
+                                            metrics.subscriptions(method).decrement(1);
                                         }
                                         Ok(true.into())
                                     } else {
@@ -354,13 +385,10 @@ impl PubSubServer {
                                         break Some("shutdown".as_bytes());
                                     }
                                     let (id, method) = rx.await?;
-                                    subscriptions.insert(id, method);
-                                    gauge!(
-                                        metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
-                                        "x_subscription_id" => Arc::clone(&x_subscription_id),
-                                        "method" => method.as_str()
-                                    )
-                                    .increment(1);
+                                    // same config subscribed twice shares the id
+                                    if subscriptions.insert(id, method).is_none() {
+                                        metrics.subscriptions(method).increment(1);
+                                    }
                                     Ok(id.into())
                                 },
                             };
@@ -382,16 +410,11 @@ impl PubSubServer {
                         Err(_) => break None, // means shutdown
                     },
                     message = notifications.recv() => match message {
-                        Ok(notification) if subscriptions.contains_key(&notification.subscription_id) => {
+                        Some(ClientNotification::Notification(notification)) if subscriptions.contains_key(&notification.subscription_id) => {
                             if notification.is_final
                                 && let Some(method) = subscriptions.remove(&notification.subscription_id)
                             {
-                                gauge!(
-                                    metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
-                                    "x_subscription_id" => Arc::clone(&x_subscription_id),
-                                    "method" => method.as_str()
-                                )
-                                .decrement(1);
+                                metrics.subscriptions(method).decrement(1);
                             }
 
                             match notification.json.upgrade() {
@@ -399,28 +422,17 @@ impl PubSubServer {
                                     let size = json.len();
                                     let frame = Frame::text(Payload::Borrowed(json.as_bytes()));
                                     ws_tx.write_frame(frame).await?;
-
-                                    counter!(
-                                        metrics::PUBSUB_MESSAGES_SENT_COUNT_TOTAL,
-                                        "x_subscription_id" => Arc::clone(&x_subscription_id),
-                                        "subscription" => notification.method.as_str(),
-                                    )
-                                    .increment(1);
-                                    counter!(
-                                        metrics::PUBSUB_MESSAGES_SENT_BYTES_TOTAL,
-                                        "x_subscription_id" => Arc::clone(&x_subscription_id),
-                                        "subscription" => notification.method.as_str(),
-                                    )
-                                    .increment(size as u64);
+                                    metrics.sent(notification.method, size);
                                 },
                                 None => {
                                     break Some("lagged: memory".as_bytes())
                                 }
                             }
                         },
-                        Ok(_) => {},
-                        Err(broadcast::error::RecvError::Closed) => break Some("shutdown".as_bytes()),
-                        Err(broadcast::error::RecvError::Lagged(_)) => break Some("lagged: len".as_bytes()),
+                        // unsubscribed while the notification was queued
+                        Some(ClientNotification::Notification(_)) => {},
+                        Some(ClientNotification::Lagged) => break Some("lagged: len".as_bytes()),
+                        None => break Some("shutdown".as_bytes()),
                     }
                 }
             };
@@ -429,12 +441,7 @@ impl PubSubServer {
                 ws_tx.write_frame(frame).await?;
             }
             for (_subscription_id, method) in subscriptions {
-                gauge!(
-                    metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
-                    "x_subscription_id" => Arc::clone(&x_subscription_id),
-                    "method" => method.as_str()
-                )
-                .decrement(1);
+                metrics.subscriptions(method).decrement(1);
             }
             Ok::<(), anyhow::Error>(())
         })
@@ -442,6 +449,53 @@ impl PubSubServer {
         .and_then(ready);
 
         tokio::try_join!(read_fut, write_fut).map(|((), ())| ())
+    }
+}
+
+/// Metric handles of a client, a registry lookup per notification is expensive.
+struct ClientMetrics {
+    x_subscription_id: Arc<str>,
+    /// (messages, bytes) sent per method
+    sent: [Option<(Counter, Counter)>; SubscribeMethod::COUNT],
+    subscriptions: [Option<Gauge>; SubscribeMethod::COUNT],
+}
+
+impl ClientMetrics {
+    const fn new(x_subscription_id: Arc<str>) -> Self {
+        Self {
+            x_subscription_id,
+            sent: [const { None }; SubscribeMethod::COUNT],
+            subscriptions: [const { None }; SubscribeMethod::COUNT],
+        }
+    }
+
+    fn sent(&mut self, method: SubscribeMethod, size: usize) {
+        let (count, bytes) = self.sent[method as usize].get_or_insert_with(|| {
+            (
+                counter!(
+                    metrics::PUBSUB_MESSAGES_SENT_COUNT_TOTAL,
+                    "x_subscription_id" => Arc::clone(&self.x_subscription_id),
+                    "subscription" => method.as_str(),
+                ),
+                counter!(
+                    metrics::PUBSUB_MESSAGES_SENT_BYTES_TOTAL,
+                    "x_subscription_id" => Arc::clone(&self.x_subscription_id),
+                    "subscription" => method.as_str(),
+                ),
+            )
+        });
+        count.increment(1);
+        bytes.increment(size as u64);
+    }
+
+    fn subscriptions(&mut self, method: SubscribeMethod) -> &Gauge {
+        self.subscriptions[method as usize].get_or_insert_with(|| {
+            gauge!(
+                metrics::PUBSUB_SUBSCRIPTIONS_TOTAL,
+                "x_subscription_id" => Arc::clone(&self.x_subscription_id),
+                "method" => method.as_str()
+            )
+        })
     }
 }
 

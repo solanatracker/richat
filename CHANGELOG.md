@@ -21,6 +21,15 @@ The minor version will be incremented upon a breaking change and the patch versi
 - richat: fix inclusive disk replay cursors, bounded decoding, and handoff to the matching live commitment; cancel stale replay workers on subscription changes.
 - richat: preserve journal indices and payload references across restart, handle skipped slots, and stop advertising partially evicted memory slots.
 - richat: keep the highest account write version in committed streams and reconstructed blocks when updates arrive out of order.
+- richat: fix the gRPC blockhash cache cleanup. It removed valid blockhashes and kept expired ones forever: about one entry per slot (~200k/day), with a full scan on every finalized slot. `isBlockhashValid` also missed recent blockhashes. Now only block meta adds blockhashes, and entries are dropped once the finalized block height passes their last valid block height.
+- richat: stop reading gRPC subscribe requests once the response stream ends (lagged, error or dropped). A client that kept its request stream open after an error left the subscription, its filter and its `grpc_subscribe_total` gauge alive until the connection closed.
+- richat: on storage start, remove segment files that the metadata does not reference. A crash between creating or deleting a segment file and committing metadata left files that were never trimmed. A created one also blocked the next rotation with `AlreadyExists` on every restart.
+- richat, shared: bound `x_subscription_id` metric labels: the value comes from a client header and every distinct value created ~35 series that were never removed; only the first `metrics.max_subscription_ids` (default 1024) values are kept, the rest is reported as `other`, values are truncated to 64 bytes.
+- richat: reconnect a source that sends nothing (data or ping) for `reconnect.idle_timeout` (default 30s, `null` to disable); before, an upstream that kept the connection alive but stopped sending stalled ingestion forever.
+- richat: wait for the reconnect backoff before resubscribing when an upstream rejects replay history while other sources move the replay slot; before, it was redialed ~2.5 times per second.
+- richat: bound not finalized per-slot state with `channel.max_unfinalized_slots` (default 1024): when finalized stalls, or a source never sends it, the oldest slots are dropped (`channel_unfinalized_slots_dropped_total`, new `channel_unfinalized_slots_total` gauge) instead of growing without limit.
+- richat: cap the storage metadata RocksDB WAL (64MiB) and rotate its info LOG (16MiB, 4 files); the slowly written `slots` column family pinned up to ~2GiB of WAL, replayed on every restart.
+- richat: pubsub removes a client's subscriptions when its websocket closes; before, removal ran at upgrade time, so subscriptions of disconnected clients stayed matched forever.
 
 ### Features
 
@@ -40,6 +49,7 @@ The minor version will be incremented upon a breaking change and the patch versi
 - richat: cache per-client gRPC subscribe message counters instead of a metrics registry lookup per message.
 - client: gRPC defaults raised for high-volume streams: `initial_connection_window_size` 64MiB, `initial_stream_window_size` 32MiB, `max_decoding_message_size` 16MiB.
 - richat: pubsub `tcp_nodelay` defaults to `true`; gRPC `messages_cached_max` defaults to `16_384`; example config uses `parser: limited` for sources.
+- richat: pubsub matches messages through per-commitment indexes (`accountSubscribe` by pubkey, `programSubscribe` by owner, `signatureSubscribe` by signature, `logsSubscribe` mentions by pubkey), so a message costs O(candidate subscriptions) instead of a scan of every subscription of the method; each notification is encoded once per subscription and delivered only to its clients through a bounded per-client queue (`notifications_messages_max_count` entries) instead of a broadcast every client filters; a full queue drops that client (`lagged: len`) without blocking the tracker; per-client sent counters and subscription gauges are cached.
 
 ### Breaking
 

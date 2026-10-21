@@ -23,7 +23,7 @@ use {
     },
     metrics::{counter, histogram},
     quanta::Instant,
-    richat_metrics::duration_to_seconds,
+    richat_metrics::{duration_to_seconds, subscription_id_label},
     std::{collections::HashMap, fmt, sync::Arc},
 };
 
@@ -139,7 +139,7 @@ impl<S: Clone> RpcRequestsProcessor<S> {
         buffer.push(b'\n');
         counter!(
             RPC_REQUESTS_GENERATED_BYTES_TOTAL,
-            "x_subscription_id" => x_subscription_id,
+            "x_subscription_id" => subscription_id_label(&x_subscription_id),
         )
         .increment(buffer.len() as u64);
         response_200(buffer, &self.extra_headers)
@@ -168,6 +168,7 @@ impl<S: Clone> RpcRequestsProcessor<S> {
             request,
         )
         .await;
+        let x_subscription_id = subscription_id_label(&x_subscription_id);
         counter!(
             RPC_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),

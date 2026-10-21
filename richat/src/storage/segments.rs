@@ -32,11 +32,12 @@ use {
         collections::{BTreeMap, HashMap, HashSet},
         fs::{File, OpenOptions},
         io::{Seek, SeekFrom, Write},
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, Weak},
         thread,
         time::Instant,
     },
+    tracing::warn,
     zstd::bulk::Compressor,
 };
 
@@ -571,6 +572,10 @@ impl SegmentWriter {
         segment_target_size: u64,
         metadata: Metadata,
     ) -> anyhow::Result<Self> {
+        // a crash between creating / deleting a segment file and committing metadata leaves
+        // files that nothing references: they would never be trimmed, and the id of a created
+        // one is allocated again, `create_new` below fails on every restart
+        remove_orphan_segments(&segments_path, &metadata.catalog())?;
         {
             let catalog = metadata.catalog();
             if catalog.state.active_segment_id == 0 {
@@ -884,6 +889,32 @@ fn segment_file_name(segment_id: u64) -> String {
     format!("{segment_id:012}.seg")
 }
 
+/// Removes segment files absent from the catalog, returns the number of removed files
+fn remove_orphan_segments(segments_path: &Path, catalog: &MetadataMirror) -> anyhow::Result<usize> {
+    let mut removed = 0;
+    let entries = std::fs::read_dir(segments_path)
+        .with_context(|| format!("failed to read segments path: {segments_path:?}"))?;
+    for entry in entries {
+        let path = entry?.path();
+        let Some(segment_id) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".seg"))
+            .filter(|id| id.len() == 12 && id.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|id| id.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if !catalog.segments.contains_key(&segment_id) {
+            warn!("remove segment file not referenced by metadata: {path:?}");
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove orphan segment {path:?}"))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -947,6 +978,54 @@ mod tests {
                     .all(|record| record.commitment == CommitmentLevel::Processed)
             );
         }
+    }
+
+    #[test]
+    fn orphan_segments_are_removed_and_their_ids_reused_on_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("richat-orphan-segments-{}", std::process::id()));
+        let segments_path = dir.join("segments");
+        std::fs::create_dir_all(&segments_path).unwrap();
+        let open = || {
+            let metadata = Metadata::open(&dir.join("metadata"), segments_path.clone()).unwrap();
+            SegmentWriter::open(segments_path.clone(), 1, metadata).unwrap()
+        };
+
+        let mut writer = open();
+        writer.rotate_segment().unwrap();
+        assert_eq!(writer.active_segment.segment_id, 2);
+        drop(writer);
+        // crash after the next segment file was created, before metadata was committed,
+        // and after a trim was committed, before its file was deleted
+        for name in [
+            "000000000003.seg",
+            "000000000000.seg",
+            "notes.seg",
+            "000000000004.tmp",
+        ] {
+            std::fs::write(segments_path.join(name), b"orphan").unwrap();
+        }
+
+        let mut writer = open();
+        let mut names = std::fs::read_dir(&segments_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "000000000001.seg",
+                "000000000002.seg",
+                "000000000004.tmp",
+                "notes.seg"
+            ]
+        );
+        // the id of the orphan is allocated again
+        writer.rotate_segment().unwrap();
+        assert_eq!(writer.active_segment.segment_id, 3);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -42,7 +42,7 @@ use {
         time::Duration,
     },
     tokio_util::sync::CancellationToken,
-    tracing::debug,
+    tracing::{debug, warn},
 };
 
 #[derive(Debug, Clone)]
@@ -311,6 +311,7 @@ pub struct Messages {
     parser: MessageParserEncoding,
     storage: Option<Storage>,
     storage_max_slots: usize,
+    max_unfinalized_slots: usize,
     replay_info: Option<Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>>,
 }
 
@@ -353,6 +354,7 @@ impl Messages {
             parser,
             storage,
             storage_max_slots,
+            max_unfinalized_slots: config.max_unfinalized_slots.max(1),
             replay_info: None,
         };
         Ok((messages, threads))
@@ -473,6 +475,9 @@ impl Messages {
             global_replay_from_slot: global_replay_from_slot.clone(),
             storage: self.storage.clone(),
             storage_max_slots: self.storage_max_slots,
+            max_unfinalized_slots: self.max_unfinalized_slots,
+            slot_dropped: 0,
+            slots_dropped: 0,
             hasher,
             replay,
             index,
@@ -678,6 +683,11 @@ pub struct Sender {
     global_replay_from_slot: GlobalReplayFromSlot,
     storage: Option<Storage>,
     storage_max_slots: usize,
+    max_unfinalized_slots: usize,
+    /// newest slot dropped by `max_unfinalized_slots`, nothing older is accepted
+    slot_dropped: Slot,
+    /// slots dropped since the last finalized slot
+    slots_dropped: u64,
     index: u64,
     hasher: RandomState,
     replay: Arc<Mutex<BTreeMap<Slot, ReplayInfo>>>,
@@ -717,7 +727,7 @@ impl Sender {
         let slot = message.slot();
 
         // early return, probably nothing can be received after finalized slot status?
-        if slot <= self.slot_finalized {
+        if slot <= self.slot_finalized.max(self.slot_dropped) {
             return;
         }
 
@@ -1008,6 +1018,7 @@ impl Sender {
         }
 
         if clean_after_finalized {
+            self.slots_dropped = 0;
             loop {
                 match self.slots.keys().next().copied() {
                     Some(slot_min) if slot_min <= self.slot_finalized => {
@@ -1025,6 +1036,27 @@ impl Sender {
                 }
             }
         }
+        // finalized stalled, or a source never sends it: per-slot state is freed only on
+        // finalized, bound it, the dropped slots can't be confirmed / finalized anymore
+        while self.slots.len() > self.max_unfinalized_slots
+            && let Some((slot, _slot_info)) = self.slots.pop_first()
+        {
+            self.slot_dropped = self.slot_dropped.max(slot);
+            self.slots_dropped += 1;
+            if self.slots_dropped == 1 || self.slots_dropped.is_multiple_of(1_000) {
+                warn!(
+                    slot,
+                    slot_finalized = self.slot_finalized,
+                    dropped = self.slots_dropped,
+                    "finalized is stalled, drop not finalized slots"
+                );
+            }
+            counter!(metrics::CHANNEL_UNFINALIZED_SLOTS_DROPPED_TOTAL).increment(1);
+        }
+        while self.dedup.len() > self.max_unfinalized_slots {
+            self.dedup.pop_first();
+        }
+        gauge!(metrics::CHANNEL_UNFINALIZED_SLOTS_TOTAL).set(self.slots.len() as f64);
         if self.storage.is_some() {
             let first_retained = replay_lock
                 .last_key_value()
