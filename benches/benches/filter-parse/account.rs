@@ -16,6 +16,7 @@ pub fn bench_parse_accounts(criterion: &mut Criterion) {
             let (slot, replica) = acc.to_replica();
             let msg = ProtobufMessage::Account {
                 slot,
+                bank_id: acc.bank_id,
                 account: &replica,
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)

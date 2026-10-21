@@ -7,6 +7,7 @@ use {
         encoding::{self, DecodeContext, WireType},
     },
     richat_proto::convert_to,
+    solana_clock::BankId,
     solana_transaction_status::RewardsAndNumPartitions,
     std::ops::Deref,
 };
@@ -14,11 +15,12 @@ use {
 #[derive(Debug)]
 pub struct BlockMeta<'a> {
     blockinfo: &'a ReplicaBlockInfoV4<'a>,
+    bank_id: BankId,
 }
 
 impl<'a> BlockMeta<'a> {
-    pub const fn new(blockinfo: &'a ReplicaBlockInfoV4<'a>) -> Self {
-        Self { blockinfo }
+    pub const fn new(blockinfo: &'a ReplicaBlockInfoV4<'a>, bank_id: BankId) -> Self {
+        Self { blockinfo, bank_id }
     }
 }
 
@@ -50,6 +52,9 @@ impl Message for BlockMeta<'_> {
         }
         if self.blockinfo.entry_count != 0 {
             encoding::uint64::encode(9, &self.blockinfo.entry_count, buf);
+        }
+        if self.bank_id != 0 {
+            encoding::uint64::encode(10, &self.bank_id, buf);
         }
     }
 
@@ -92,6 +97,11 @@ impl Message for BlockMeta<'_> {
             }
             + if self.blockinfo.entry_count != 0 {
                 encoding::uint64::encoded_len(9, &self.blockinfo.entry_count)
+            } else {
+                0
+            }
+            + if self.bank_id != 0 {
+                encoding::uint64::encoded_len(10, &self.bank_id)
             } else {
                 0
             }

@@ -102,6 +102,7 @@ impl SubscribeMethod {
             ParsedMessage::Entry(_) => &[],
             ParsedMessage::BlockMeta(_) => &[],
             ParsedMessage::Block(_) => &[Self::Block],
+            ParsedMessage::BlockFooter(_) | ParsedMessage::EntryUpdateParent(_) => &[],
         }
     }
 

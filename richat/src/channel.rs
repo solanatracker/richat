@@ -9,8 +9,9 @@ use {
     richat_filter::{
         filter::FilteredUpdate,
         message::{
-            Message, MessageAccount, MessageBlock, MessageBlockMeta, MessageEntry,
-            MessageParserEncoding, MessageRef, MessageSlot, MessageTransaction,
+            Message, MessageAccount, MessageBlock, MessageBlockFooter, MessageBlockMeta,
+            MessageEntry, MessageEntryUpdateParent, MessageParserEncoding, MessageRef, MessageSlot,
+            MessageTransaction,
         },
     },
     richat_proto::{geyser::SlotStatus, richat::RichatFilter},
@@ -19,7 +20,7 @@ use {
         transports::{RecvError, RecvItem, RecvStream, Subscribe, SubscribeError},
     },
     smallvec::SmallVec,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
     solana_nohash_hasher::IntMap,
     solana_pubkey::Pubkey,
@@ -129,6 +130,8 @@ pub enum ParsedMessage {
     Entry(Arc<MessageEntry>),
     BlockMeta(Arc<MessageBlockMeta>),
     Block(Arc<MessageBlock>),
+    BlockFooter(Arc<MessageBlockFooter>),
+    EntryUpdateParent(Arc<MessageEntryUpdateParent>),
 }
 
 impl From<Message> for ParsedMessage {
@@ -140,6 +143,8 @@ impl From<Message> for ParsedMessage {
             Message::Entry(msg) => Self::Entry(Arc::new(msg)),
             Message::BlockMeta(msg) => Self::BlockMeta(Arc::new(msg)),
             Message::Block(msg) => Self::Block(Arc::new(msg)),
+            Message::BlockFooter(msg) => Self::BlockFooter(Arc::new(msg)),
+            Message::EntryUpdateParent(msg) => Self::EntryUpdateParent(Arc::new(msg)),
         }
     }
 }
@@ -153,6 +158,8 @@ impl<'a> From<&'a ParsedMessage> for MessageRef<'a> {
             ParsedMessage::Entry(msg) => Self::Entry(msg.as_ref()),
             ParsedMessage::BlockMeta(msg) => Self::BlockMeta(msg.as_ref()),
             ParsedMessage::Block(msg) => Self::Block(msg.as_ref()),
+            ParsedMessage::BlockFooter(msg) => Self::BlockFooter(msg.as_ref()),
+            ParsedMessage::EntryUpdateParent(msg) => Self::EntryUpdateParent(msg.as_ref()),
         }
     }
 }
@@ -166,6 +173,8 @@ impl ParsedMessage {
             Self::Entry(_msg) => "entry",
             Self::BlockMeta(_msg) => "blockmeta",
             Self::Block(_msg) => "block",
+            Self::BlockFooter(_msg) => "blockfooter",
+            Self::EntryUpdateParent(_msg) => "entryupdateparent",
         }
     }
 
@@ -177,7 +186,25 @@ impl ParsedMessage {
             Self::Entry(msg) => msg.slot(),
             Self::BlockMeta(msg) => msg.slot(),
             Self::Block(msg) => msg.slot(),
+            Self::BlockFooter(msg) => msg.slot(),
+            Self::EntryUpdateParent(msg) => msg.slot(),
         }
+    }
+
+    /// Alpenglow bank (candidate block) of the message, `None` for messages not tied to a bank
+    /// and for sources without `bank_id`; for `EntryUpdateParent` it is the cleared bank
+    pub fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Slot(msg) => msg.bank_id(),
+            Self::Account(msg) => msg.bank_id(),
+            Self::Transaction(msg) => msg.bank_id(),
+            Self::Entry(msg) => msg.bank_id(),
+            Self::BlockMeta(msg) => msg.bank_id(),
+            Self::Block(msg) => msg.bank_id(),
+            Self::BlockFooter(msg) => msg.bank_id(),
+            Self::EntryUpdateParent(msg) => Some(msg.cleared_bank_id()),
+        }
+        .filter(|bank_id| *bank_id != 0)
     }
 
     pub fn size(&self) -> usize {
@@ -188,6 +215,8 @@ impl ParsedMessage {
             Self::Entry(msg) => msg.size(),
             Self::BlockMeta(msg) => msg.size(),
             Self::Block(msg) => msg.size(),
+            Self::BlockFooter(msg) => msg.size(),
+            Self::EntryUpdateParent(msg) => msg.size(),
         }
     }
 
@@ -216,6 +245,8 @@ impl ParsedMessage {
     }
 
     fn get_id<H: Hasher>(&self, mut state: H) -> u64 {
+        // candidates of the same slot carry the same content, but are different events
+        state.write_u64(self.bank_id().unwrap_or_default());
         match self {
             ParsedMessage::Slot(msg) => {
                 state.write_u8(0);
@@ -248,6 +279,14 @@ impl ParsedMessage {
             }
             ParsedMessage::Block(msg) => {
                 state.write_u8(5);
+                state.write_u64(msg.slot());
+            }
+            ParsedMessage::BlockFooter(msg) => {
+                state.write_u8(6);
+                state.write_u64(msg.slot());
+            }
+            ParsedMessage::EntryUpdateParent(msg) => {
+                state.write_u8(7);
                 state.write_u64(msg.slot());
             }
         }
@@ -621,6 +660,8 @@ impl Subscribe for Messages {
             enable_notifications_accounts: !filter.disable_accounts,
             enable_notifications_transactions: !filter.disable_transactions,
             enable_notifications_entries: !filter.disable_entries,
+            enable_notifications_block_footers: filter.enable_block_footers,
+            enable_notifications_entry_update_parents: filter.enable_entry_update_parents,
         }
         .boxed())
     }
@@ -651,7 +692,7 @@ impl Sender {
             storage.begin_live_epoch(self.index)?;
         }
         for info in self.slots.values_mut() {
-            info.failed = true; // These slots were abandoned deliberately.
+            info.abandon(); // These slots were abandoned deliberately.
         }
         self.slots.clear();
         self.dedup.clear();
@@ -680,89 +721,128 @@ impl Sender {
             return;
         }
 
+        // messages of a cleared (replaced) bank are invalid
+        let bank_id = message.bank_id().filter(|bank_id| *bank_id != 0);
+        if let Some(bank_id) = bank_id
+            && !matches!(message, Message::EntryUpdateParent(_))
+            && self
+                .slots
+                .get(&slot)
+                .is_some_and(|info| info.cleared_banks.contains(&bank_id))
+        {
+            return;
+        }
+
         // get or create slot info
         let mut messages = SmallVec::<[ParsedMessage; 4]>::new();
         if dedup_required {
             // dedup info
             let dedup = self.dedup.entry(slot).or_default();
 
-            match message {
-                Message::Slot(msg) => {
-                    let index = msg.status() as i32 as usize;
-                    if !dedup.slots[index] {
-                        dedup.slots[index] = true;
-                        messages.push(ParsedMessage::Slot(Arc::new(msg)));
-                    }
+            // `bank_id` is local to the node, so bank-scoped messages of a slot are
+            // accepted only from the first source that sent one of them
+            if bank_id.is_some() {
+                match dedup.source {
+                    Some(source) if source != source_name => return,
+                    Some(_) => {}
+                    None => dedup.source = Some(source_name),
                 }
-                Message::Account(mut msg) => {
-                    let key = DedupInfoAccountTransactionKey::from(&msg);
-                    if dedup.accounts_updates.insert(key) {
-                        if let Some(signature) = key.signature {
-                            match dedup.transactions.entry(signature) {
-                                HashMapEntry::Occupied(mut entry) => match entry.get_mut() {
-                                    DedupInfoTransactionIndex::Index(index) => {
-                                        msg.update_write_version(*index as u64);
-                                        messages.push(ParsedMessage::Account(Arc::new(msg)));
+            }
+
+            if let Message::Slot(msg) = message {
+                let slots = dedup.slots.entry(bank_id).or_default();
+                let index = msg.status() as i32 as usize;
+                if !slots[index] {
+                    slots[index] = true;
+                    messages.push(ParsedMessage::Slot(Arc::new(msg)));
+                }
+            } else {
+                let dedup = dedup.banks.entry(bank_id).or_default();
+                match message {
+                    Message::Slot(_) => unreachable!(),
+                    Message::Account(mut msg) => {
+                        let key = DedupInfoAccountTransactionKey::from(&msg);
+                        if dedup.accounts_updates.insert(key) {
+                            if let Some(signature) = key.signature {
+                                match dedup.transactions.entry(signature) {
+                                    HashMapEntry::Occupied(mut entry) => match entry.get_mut() {
+                                        DedupInfoTransactionIndex::Index(index) => {
+                                            msg.update_write_version(*index as u64);
+                                            messages.push(ParsedMessage::Account(Arc::new(msg)));
+                                        }
+                                        DedupInfoTransactionIndex::Accounts(vec) => {
+                                            vec.push(msg);
+                                        }
+                                    },
+                                    HashMapEntry::Vacant(entry) => {
+                                        entry
+                                            .insert(DedupInfoTransactionIndex::Accounts(vec![msg]));
                                     }
-                                    DedupInfoTransactionIndex::Accounts(vec) => {
-                                        vec.push(msg);
-                                    }
-                                },
-                                HashMapEntry::Vacant(entry) => {
-                                    entry.insert(DedupInfoTransactionIndex::Accounts(vec![msg]));
                                 }
+                            } else {
+                                let index = dedup.accounts_updates_phantom_index;
+                                dedup.accounts_updates_phantom_index += 1;
+                                msg.update_write_version(index);
+                                messages.push(ParsedMessage::Account(Arc::new(msg)));
                             }
-                        } else {
-                            let index = dedup.accounts_updates_phantom_index;
-                            dedup.accounts_updates_phantom_index += 1;
-                            msg.update_write_version(index);
-                            messages.push(ParsedMessage::Account(Arc::new(msg)));
                         }
                     }
-                }
-                Message::Transaction(msg) => {
-                    // we keep some space for account updates without signature
-                    let index = msg.index() as usize + 1_000;
-                    match dedup.transactions.entry(msg.signature()) {
-                        HashMapEntry::Occupied(mut entry) => {
-                            let entry = entry.get_mut();
-                            if let DedupInfoTransactionIndex::Accounts(vec) = entry {
-                                for mut msg in vec.drain(..) {
-                                    msg.update_write_version(index as u64);
-                                    messages.push(ParsedMessage::Account(Arc::new(msg)));
-                                }
+                    Message::Transaction(msg) => {
+                        // we keep some space for account updates without signature
+                        let index = msg.index() as usize + 1_000;
+                        match dedup.transactions.entry(msg.signature()) {
+                            HashMapEntry::Occupied(mut entry) => {
+                                let entry = entry.get_mut();
+                                if let DedupInfoTransactionIndex::Accounts(vec) = entry {
+                                    for mut msg in vec.drain(..) {
+                                        msg.update_write_version(index as u64);
+                                        messages.push(ParsedMessage::Account(Arc::new(msg)));
+                                    }
 
-                                *entry = DedupInfoTransactionIndex::Index(index);
+                                    *entry = DedupInfoTransactionIndex::Index(index);
+                                    messages.push(ParsedMessage::Transaction(Arc::new(msg)));
+                                }
+                            }
+                            HashMapEntry::Vacant(entry) => {
+                                entry.insert(DedupInfoTransactionIndex::Index(index));
                                 messages.push(ParsedMessage::Transaction(Arc::new(msg)));
                             }
                         }
-                        HashMapEntry::Vacant(entry) => {
-                            entry.insert(DedupInfoTransactionIndex::Index(index));
-                            messages.push(ParsedMessage::Transaction(Arc::new(msg)));
+                    }
+                    Message::Entry(msg) => {
+                        let index = msg.index() as usize;
+                        if dedup.entries.len() <= index {
+                            dedup.entries.resize(
+                                index.next_power_of_two().max(dedup.entries.len() * 2),
+                                false,
+                            );
+                        }
+                        if !dedup.entries[index] {
+                            dedup.entries[index] = true;
+                            messages.push(ParsedMessage::Entry(Arc::new(msg)));
                         }
                     }
-                }
-                Message::Entry(msg) => {
-                    let index = msg.index() as usize;
-                    if dedup.entries.len() <= index {
-                        dedup.entries.resize(
-                            index.next_power_of_two().max(dedup.entries.len() * 2),
-                            false,
-                        );
+                    Message::BlockMeta(msg) => {
+                        if !dedup.block_meta {
+                            dedup.block_meta = true;
+                            messages.push(ParsedMessage::BlockMeta(Arc::new(msg)));
+                        }
                     }
-                    if !dedup.entries[index] {
-                        dedup.entries[index] = true;
-                        messages.push(ParsedMessage::Entry(Arc::new(msg)));
+                    Message::Block(_) => unreachable!(),
+                    Message::BlockFooter(msg) => {
+                        if !dedup.block_footer {
+                            dedup.block_footer = true;
+                            messages.push(ParsedMessage::BlockFooter(Arc::new(msg)));
+                        }
                     }
-                }
-                Message::BlockMeta(msg) => {
-                    if !dedup.block_meta {
-                        dedup.block_meta = true;
-                        messages.push(ParsedMessage::BlockMeta(Arc::new(msg)));
+                    Message::EntryUpdateParent(msg) => {
+                        if !dedup.entry_update_parent {
+                            dedup.entry_update_parent = true;
+                            messages.push(ParsedMessage::EntryUpdateParent(Arc::new(msg)));
+                        }
                     }
-                }
-                Message::Block(_) => unreachable!(),
-            };
+                };
+            }
         } else {
             messages.push(message.into());
         }
@@ -790,7 +870,15 @@ impl Sender {
                 .entry(slot)
                 .or_insert_with(|| SlotInfo::new(slot, replay.head));
             let slot_index_head = slot_info.index;
-            let block_message = slot_info.get_block_message(&message);
+            let message_bank_id = message.bank_id();
+            // bank selected by confirmed / finalized status
+            let mut commitment_bank_id = None;
+            let block_message = if let ParsedMessage::Slot(msg) = &message {
+                commitment_bank_id = slot_info.commit(msg.status(), message_bank_id);
+                None
+            } else {
+                slot_info.get_block_message(&message)
+            };
 
             for message in [Some(message), block_message].into_iter().flatten() {
                 if let Some(messages) = &mut replay.messages {
@@ -851,12 +939,13 @@ impl Sender {
                         );
                     }
 
-                    // push messages to confirmed
+                    // push messages of the confirmed bank to confirmed
                     if msg.status() == SlotStatus::SlotConfirmed
+                        && let Some(bank_id) = commitment_bank_id
                         && let Some(shared) = self.confirmed.as_mut()
                         && let Some(slot_info) = self.slots.get(&slot)
                     {
-                        for message in slot_info.get_messages_cloned() {
+                        for message in slot_info.get_messages_cloned(bank_id) {
                             shared.push_stored(
                                 slot,
                                 message,
@@ -873,9 +962,10 @@ impl Sender {
                         self.slot_finalized = slot;
                         self.global_replay_from_slot.store(slot + 1);
                         if let Some(shared) = self.finalized.as_mut()
+                            && let Some(bank_id) = commitment_bank_id
                             && let Some(mut slot_info) = self.slots.remove(&slot)
                         {
-                            for message in slot_info.get_messages_owned() {
+                            for message in slot_info.get_messages_owned(bank_id) {
                                 shared.push_stored(
                                     slot,
                                     message,
@@ -887,8 +977,13 @@ impl Sender {
                         }
                     }
                 } else {
-                    // push to confirmed (if we received SlotStatus or message after it)
-                    if self.slots.get(&slot).is_some_and(|info| info.confirmed)
+                    // push to confirmed (if we received SlotStatus or message after it),
+                    // only messages of the confirmed bank, `EntryUpdateParent` is processed-only
+                    if !matches!(message, ParsedMessage::EntryUpdateParent(_))
+                        && self
+                            .slots
+                            .get(&slot)
+                            .is_some_and(|info| info.confirmed_bank == Some(message_bank_id))
                         && let Some(shared) = self.confirmed.as_mut()
                     {
                         shared.push_stored(
@@ -1116,6 +1211,8 @@ pub struct ReceiverAsync {
     enable_notifications_accounts: bool,
     enable_notifications_transactions: bool,
     enable_notifications_entries: bool,
+    enable_notifications_block_footers: bool,
+    enable_notifications_entry_update_parents: bool,
 }
 
 impl ReceiverAsync {
@@ -1136,6 +1233,14 @@ impl ReceiverAsync {
                     continue;
                 }
                 ParsedMessage::Entry(_) if !self.enable_notifications_entries => continue,
+                ParsedMessage::BlockFooter(_) if !self.enable_notifications_block_footers => {
+                    continue;
+                }
+                ParsedMessage::EntryUpdateParent(_)
+                    if !self.enable_notifications_entry_update_parents =>
+                {
+                    continue;
+                }
                 ParsedMessage::Block(_) => continue,
                 _ => {}
             }
@@ -1341,11 +1446,105 @@ struct SlotHead {
     head: u64,
 }
 
-#[derive(Debug, Default)]
+/// Slot state, Alpenglow can replay several candidate blocks (banks) of the same slot
+#[derive(Debug)]
 struct SlotInfo {
     slot: Slot,
+    index: u64,
+    /// bank selected by the confirmed status (`None` bank: messages without `bank_id`)
+    confirmed_bank: Option<Option<BankId>>,
+    banks: BTreeMap<Option<BankId>, BankInfo>,
+    /// banks cleared by `EntryUpdateParent`, all their messages are invalid
+    cleared_banks: HashSet<BankId, RandomState>,
+}
+
+impl SlotInfo {
+    fn new(slot: Slot, index: u64) -> Self {
+        Self {
+            slot,
+            index,
+            confirmed_bank: None,
+            banks: BTreeMap::new(),
+            cleared_banks: HashSet::default(),
+        }
+    }
+
+    fn abandon(&mut self) {
+        for bank in self.banks.values_mut() {
+            bank.failed = true;
+        }
+    }
+
+    /// Returns bank which messages should be pushed to the commitment of the status
+    fn commit(&mut self, status: SlotStatus, bank_id: Option<BankId>) -> Option<Option<BankId>> {
+        let bank_id = match status {
+            SlotStatus::SlotConfirmed if self.confirmed_bank.is_none() => {
+                let bank_id = self.select_bank(bank_id);
+                self.confirmed_bank = Some(bank_id);
+                bank_id
+            }
+            SlotStatus::SlotFinalized => self.select_bank(bank_id),
+            _ => return None,
+        };
+        if let Some(bank) = self.banks.get_mut(&bank_id) {
+            bank.landed = true;
+        }
+        Some(bank_id)
+    }
+
+    fn select_bank(&self, bank_id: Option<BankId>) -> Option<BankId> {
+        // status without bank (source without `bank_id` or a recovered missed status):
+        // confirmed bank, a single candidate or the latest one
+        bank_id
+            .or(self.confirmed_bank.flatten())
+            .or_else(|| self.banks.keys().next_back().copied().flatten())
+    }
+
+    fn get_block_message(&mut self, message: &ParsedMessage) -> Option<ParsedMessage> {
+        if let ParsedMessage::EntryUpdateParent(_) = message {
+            if let Some(bank_id) = message.bank_id() {
+                self.cleared_banks.insert(bank_id);
+                if let Some(mut bank) = self.banks.remove(&Some(bank_id)) {
+                    bank.failed = true;
+                }
+            }
+            return None;
+        }
+
+        let slot = self.slot;
+        self.banks
+            .entry(message.bank_id())
+            .or_insert_with(|| BankInfo::new(slot))
+            .get_block_message(message)
+    }
+
+    fn get_messages_cloned(
+        &self,
+        bank_id: Option<BankId>,
+    ) -> impl Iterator<Item = ParsedMessage> + '_ {
+        self.banks
+            .get(&bank_id)
+            .into_iter()
+            .flat_map(|bank| bank.messages.iter())
+            .filter_map(|item| item.as_ref().cloned())
+    }
+
+    fn get_messages_owned(
+        &mut self,
+        bank_id: Option<BankId>,
+    ) -> impl Iterator<Item = ParsedMessage> + '_ {
+        self.banks
+            .get_mut(&bank_id)
+            .into_iter()
+            .flat_map(|bank| bank.messages.drain(..))
+            .flatten()
+    }
+}
+
+#[derive(Debug, Default)]
+struct BankInfo {
+    slot: Slot,
     block_created: bool,
-    confirmed: bool,
     failed: bool,
     landed: bool,
     messages: Vec<Option<ParsedMessage>>,
@@ -1353,10 +1552,9 @@ struct SlotInfo {
     transactions_count: usize,
     entries_count: usize,
     block_meta: Option<Arc<MessageBlockMeta>>,
-    index: u64,
 }
 
-impl Drop for SlotInfo {
+impl Drop for BankInfo {
     fn drop(&mut self) {
         if !self.block_created && !self.failed && self.landed {
             let mut reasons = vec![];
@@ -1384,12 +1582,11 @@ impl Drop for SlotInfo {
     }
 }
 
-impl SlotInfo {
-    fn new(slot: Slot, index: u64) -> Self {
+impl BankInfo {
+    fn new(slot: Slot) -> Self {
         Self {
             slot,
             block_created: false,
-            confirmed: false,
             failed: false,
             landed: false,
             messages: Vec::with_capacity(16_384),
@@ -1397,25 +1594,14 @@ impl SlotInfo {
             transactions_count: 0,
             entries_count: 0,
             block_meta: None,
-            index,
         }
     }
 
     fn get_block_message(&mut self, message: &ParsedMessage) -> Option<ParsedMessage> {
-        // mark as landed
-        if let ParsedMessage::Slot(message) = message
-            && matches!(
-                message.status(),
-                SlotStatus::SlotConfirmed | SlotStatus::SlotFinalized
-            )
-        {
-            self.landed = true;
-        }
-
-        if let ParsedMessage::Slot(status) = message
-            && status.status() == SlotStatus::SlotConfirmed
-        {
-            self.confirmed = true;
+        // footer is not a part of the block and can be received after it
+        if let ParsedMessage::BlockFooter(_) = message {
+            self.messages.push(Some(message.clone()));
+            return None;
         }
 
         // report error if block already created
@@ -1424,7 +1610,6 @@ impl SlotInfo {
                 self.failed = true;
                 let mut reasons = vec![];
                 match message {
-                    ParsedMessage::Slot(_) => {}
                     ParsedMessage::Account(_) => {
                         reasons.push(metrics::BlockMessageFailedReason::ExtraAccount);
                     }
@@ -1437,7 +1622,10 @@ impl SlotInfo {
                     ParsedMessage::BlockMeta(_) => {
                         reasons.push(metrics::BlockMessageFailedReason::ExtraBlockMeta);
                     }
-                    ParsedMessage::Block(_) => {}
+                    ParsedMessage::Slot(_)
+                    | ParsedMessage::Block(_)
+                    | ParsedMessage::BlockFooter(_)
+                    | ParsedMessage::EntryUpdateParent(_) => {}
                 }
                 metrics::block_message_failed_inc(self.slot, &reasons);
             }
@@ -1465,7 +1653,6 @@ impl SlotInfo {
                         .insert(*pubkey, (write_version, idx_new));
                 }
             }
-            ParsedMessage::Slot(_message) => {}
             ParsedMessage::Transaction(message) => {
                 let item = ParsedMessage::Transaction(Arc::clone(message));
                 self.messages.push(Some(item));
@@ -1481,7 +1668,10 @@ impl SlotInfo {
                 self.messages.push(Some(item));
                 self.block_meta = Some(Arc::clone(message));
             }
-            ParsedMessage::Block(_message) => unreachable!(),
+            ParsedMessage::Slot(_)
+            | ParsedMessage::Block(_)
+            | ParsedMessage::BlockFooter(_)
+            | ParsedMessage::EntryUpdateParent(_) => unreachable!(),
         }
 
         //  attempt to create Block
@@ -1520,16 +1710,6 @@ impl SlotInfo {
 
         None
     }
-
-    fn get_messages_cloned(&self) -> impl Iterator<Item = ParsedMessage> + '_ {
-        self.messages
-            .iter()
-            .filter_map(|item| item.as_ref().cloned())
-    }
-
-    fn get_messages_owned(&mut self) -> impl Iterator<Item = ParsedMessage> + '_ {
-        self.messages.drain(..).flatten()
-    }
 }
 
 #[derive(Debug)]
@@ -1563,25 +1743,35 @@ mod tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DedupInfo {
-    slots: [bool; 7],
+    /// source of bank-scoped messages of the slot
+    source: Option<&'static str>,
+    slots: HashMap<Option<BankId>, [bool; 7], RandomState>,
+    banks: HashMap<Option<BankId>, DedupInfoBank, RandomState>,
+}
+
+#[derive(Debug)]
+struct DedupInfoBank {
     accounts_updates: HashSet<DedupInfoAccountTransactionKey, RandomState>,
     accounts_updates_phantom_index: u64,
     transactions: HashMap<Signature, DedupInfoTransactionIndex, RandomState>,
     entries: Vec<bool>,
     block_meta: bool,
+    block_footer: bool,
+    entry_update_parent: bool,
 }
 
-impl Default for DedupInfo {
+impl Default for DedupInfoBank {
     fn default() -> Self {
         Self {
-            slots: [false; 7],
             accounts_updates: HashSet::with_capacity_and_hasher(8_192, RandomState::default()),
             accounts_updates_phantom_index: 0,
             transactions: HashMap::with_capacity_and_hasher(8_192, RandomState::default()),
             entries: std::iter::repeat_n(false, 256).collect(),
             block_meta: false,
+            block_footer: false,
+            entry_update_parent: false,
         }
     }
 }

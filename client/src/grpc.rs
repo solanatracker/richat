@@ -88,14 +88,16 @@ impl Default for ConfigGrpcClient {
             buffer_size: None,
             http2_adaptive_window: None,
             http2_keep_alive_interval: None,
-            initial_connection_window_size: None,
-            initial_stream_window_size: None,
+            // hyper defaults (5MiB / 2MiB) cap one stream at ~2MiB per RTT, a single upstream
+            // stream carries the whole validator feed
+            initial_connection_window_size: Some(64 * 1024 * 1024), // 64MiB
+            initial_stream_window_size: Some(32 * 1024 * 1024),     // 32MiB
             keep_alive_timeout: None,
             keep_alive_while_idle: false,
             tcp_keepalive: Some(Duration::from_secs(15)),
             tcp_nodelay: true,
             timeout: None,
-            max_decoding_message_size: 4 * 1024 * 1024, // 4MiB
+            max_decoding_message_size: 16 * 1024 * 1024, // 16MiB, account messages can be > 10MiB
             compression: ConfigGrpcCompression::default(),
             x_token: None,
         }

@@ -4,8 +4,9 @@ use {
         CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
         SubscribeRequestAccountsDataSlice, SubscribeRequestFilterAccounts,
         SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterLamports,
-        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlocks,
-        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
+        SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlockFooter,
+        SubscribeRequestFilterBlocks, SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
+        SubscribeRequestFilterTransactions,
         subscribe_request_filter_accounts_filter::Filter as AccountsFilterDataOneof,
         subscribe_request_filter_accounts_filter_lamports::Cmp as AccountsFilterLamports,
         subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
@@ -70,6 +71,7 @@ pub struct ConfigLimits {
     pub entries: ConfigLimitsEntries,
     pub blocks_meta: ConfigLimitsBlocksMeta,
     pub blocks: ConfigLimitsBlocks,
+    pub block_footer: ConfigLimitsBlockFooter,
 }
 
 impl Default for ConfigLimits {
@@ -83,6 +85,7 @@ impl Default for ConfigLimits {
             entries: Default::default(),
             blocks_meta: Default::default(),
             blocks: Default::default(),
+            block_footer: Default::default(),
         }
     }
 }
@@ -153,6 +156,8 @@ impl ConfigLimits {
         self.blocks_meta
             .check_filter(self.name_max, &filter.blocks_meta)?;
         self.blocks.check_filter(self.name_max, &filter.blocks)?;
+        self.block_footer
+            .check_filter(self.name_max, &filter.block_footer)?;
 
         Ok(())
     }
@@ -371,6 +376,30 @@ impl ConfigLimitsEntries {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
+pub struct ConfigLimitsBlockFooter {
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub max: usize,
+}
+
+impl Default for ConfigLimitsBlockFooter {
+    fn default() -> Self {
+        Self { max: usize::MAX }
+    }
+}
+
+impl ConfigLimitsBlockFooter {
+    pub fn check_filter(
+        &self,
+        name_max: usize,
+        filters: &HashMap<String, ConfigFilterBlockFooter>,
+    ) -> Result<(), ConfigLimitsError> {
+        ConfigLimits::check_names_max(filters.keys(), name_max)?;
+        ConfigLimits::check_max(filters.len(), self.max)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct ConfigLimitsBlocksMeta {
     #[serde(deserialize_with = "deserialize_num_str")]
     pub max: usize,
@@ -483,8 +512,12 @@ pub struct ConfigFilter {
     pub transactions: HashMap<String, ConfigFilterTransactions>,
     pub transactions_status: HashMap<String, ConfigFilterTransactions>,
     pub entries: HashSet<String>,
+    /// Entry filters (subset of `entries`) that also receive Alpenglow `EntryUpdateParent`
+    /// updates (`include_update_parent` in Yellowstone `SubscribeRequestFilterEntry`)
+    pub entries_update_parent: HashSet<String>,
     pub blocks_meta: HashSet<String>,
     pub blocks: HashMap<String, ConfigFilterBlocks>,
+    pub block_footer: HashMap<String, ConfigFilterBlockFooter>,
     pub commitment: Option<ConfigFilterCommitment>,
 }
 
@@ -542,9 +575,16 @@ impl TryFrom<SubscribeRequest> for ConfigFilter {
                 .collect::<Result<_, _>>()?,
             transactions: Self::try_conv_map(value.transactions)?,
             transactions_status: Self::try_conv_map(value.transactions_status)?,
+            entries_update_parent: value
+                .entry
+                .iter()
+                .filter(|(_name, filter)| filter.include_update_parent == Some(true))
+                .map(|(name, _filter)| name.clone())
+                .collect(),
             entries: value.entry.into_keys().collect(),
             blocks_meta: value.blocks_meta.into_keys().collect(),
             blocks: Self::try_conv_map(value.blocks)?,
+            block_footer: Self::try_conv_map(value.block_footer)?,
             commitment: value.commitment.map(|value| value.try_into()).transpose()?,
         })
     }
@@ -562,9 +602,23 @@ impl From<ConfigFilter> for SubscribeRequest {
                 .collect(),
             transactions: ConfigFilter::conv_map(value.transactions),
             transactions_status: ConfigFilter::conv_map(value.transactions_status),
-            entry: ConfigFilter::conv_set(value.entries),
+            entry: value
+                .entries
+                .into_iter()
+                .map(|name| {
+                    let include_update_parent =
+                        value.entries_update_parent.contains(&name).then_some(true);
+                    (
+                        name,
+                        SubscribeRequestFilterEntry {
+                            include_update_parent,
+                        },
+                    )
+                })
+                .collect(),
             blocks_meta: ConfigFilter::conv_set(value.blocks_meta),
             blocks: ConfigFilter::conv_map(value.blocks),
+            block_footer: ConfigFilter::conv_map(value.block_footer),
             commitment: value.commitment.map(|c| c.into()),
             ping: None,
             from_slot: None,
@@ -945,6 +999,30 @@ impl From<ConfigFilterBlocks> for SubscribeRequestFilterBlocks {
             include_accounts: value.include_accounts,
             include_entries: value.include_entries,
             cuckoo_account_include: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigFilterBlockFooter {
+    pub include_certificates: Option<bool>,
+}
+
+impl TryFrom<SubscribeRequestFilterBlockFooter> for ConfigFilterBlockFooter {
+    type Error = ConfigFilterError;
+
+    fn try_from(value: SubscribeRequestFilterBlockFooter) -> Result<Self, Self::Error> {
+        Ok(Self {
+            include_certificates: value.include_certificates,
+        })
+    }
+}
+
+impl From<ConfigFilterBlockFooter> for SubscribeRequestFilterBlockFooter {
+    fn from(value: ConfigFilterBlockFooter) -> Self {
+        Self {
+            include_certificates: value.include_certificates,
         }
     }
 }

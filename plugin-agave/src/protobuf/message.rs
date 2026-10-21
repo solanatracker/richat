@@ -22,21 +22,28 @@ pub enum ProtobufEncoder {
 pub enum ProtobufMessage<'a> {
     Account {
         slot: Slot,
+        /// `None` only for accounts not tied to a bank (snapshot accounts are never sent)
+        bank_id: Option<BankId>,
         account: &'a ReplicaAccountInfoV3<'a>,
     },
     Slot {
         slot: Slot,
         parent: Option<u64>,
         status: &'a GeyserSlotStatus,
+        /// `None` for statuses not tied to a bank: `FirstShredReceived`, `Completed`, `Dead`
+        bank_id: Option<BankId>,
     },
     Transaction {
         slot: Slot,
+        bank_id: BankId,
         transaction: &'a ReplicaTransactionInfoV3<'a>,
     },
     Entry {
+        bank_id: BankId,
         entry: &'a ReplicaEntryInfoV2<'a>,
     },
     BlockMeta {
+        bank_id: BankId,
         blockinfo: &'a ReplicaBlockInfoV4<'a>,
     },
     // Richat-only messages, see `SubscribeUpdateRichat` in `richat.proto`
@@ -70,8 +77,8 @@ impl ProtobufMessage<'_> {
             Self::Account { slot, .. } => *slot,
             Self::Slot { slot, .. } => *slot,
             Self::Transaction { slot, .. } => *slot,
-            Self::Entry { entry } => entry.slot,
-            Self::BlockMeta { blockinfo } => blockinfo.slot,
+            Self::Entry { entry, .. } => entry.slot,
+            Self::BlockMeta { blockinfo, .. } => blockinfo.slot,
             Self::DeshredTransaction { slot, .. } => *slot,
             Self::ContactInfo { .. } | Self::ContactInfoRemoved { .. } => return None,
             Self::BlockFooter { slot, .. } => *slot,
@@ -117,7 +124,11 @@ impl ProtobufMessage<'_> {
         };
 
         let update_oneof = match self {
-            Self::Account { slot, account } => UpdateOneof::Account(SubscribeUpdateAccount {
+            Self::Account {
+                slot,
+                bank_id,
+                account,
+            } => UpdateOneof::Account(SubscribeUpdateAccount {
                 account: Some(SubscribeUpdateAccountInfo {
                     pubkey: account.pubkey.to_vec(),
                     lamports: account.lamports,
@@ -133,11 +144,13 @@ impl ProtobufMessage<'_> {
                 }),
                 slot: *slot,
                 is_startup: false,
+                bank_id: *bank_id,
             }),
             Self::Slot {
                 slot,
                 parent,
                 status,
+                bank_id,
             } => UpdateOneof::Slot(SubscribeUpdateSlot {
                 slot: *slot,
                 parent: *parent,
@@ -155,42 +168,50 @@ impl ProtobufMessage<'_> {
                 } else {
                     None
                 },
+                bank_id: *bank_id,
             }),
-            Self::Transaction { slot, transaction } => {
-                UpdateOneof::Transaction(SubscribeUpdateTransaction {
-                    transaction: Some(SubscribeUpdateTransactionInfo {
-                        signature: transaction.signature.as_ref().to_vec(),
-                        is_vote: transaction.is_vote,
-                        transaction: Some(convert_to::create_transaction(transaction.transaction)),
-                        meta: Some(convert_to::create_transaction_meta(
-                            transaction.transaction_status_meta,
-                        )),
-                        index: transaction.index as u64,
-                    }),
-                    slot: *slot,
+            Self::Transaction {
+                slot,
+                bank_id,
+                transaction,
+            } => UpdateOneof::Transaction(SubscribeUpdateTransaction {
+                transaction: Some(SubscribeUpdateTransactionInfo {
+                    signature: transaction.signature.as_ref().to_vec(),
+                    is_vote: transaction.is_vote,
+                    transaction: Some(convert_to::create_transaction(transaction.transaction)),
+                    meta: Some(convert_to::create_transaction_meta(
+                        transaction.transaction_status_meta,
+                    )),
+                    index: transaction.index as u64,
+                }),
+                slot: *slot,
+                bank_id: *bank_id,
+            }),
+            Self::BlockMeta { bank_id, blockinfo } => {
+                UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    slot: blockinfo.slot,
+                    blockhash: blockinfo.blockhash.to_string(),
+                    rewards: Some(convert_to::create_rewards_obj(
+                        &blockinfo.rewards.rewards,
+                        blockinfo.rewards.num_partitions,
+                    )),
+                    block_time: blockinfo.block_time.map(convert_to::create_timestamp),
+                    block_height: blockinfo.block_height.map(convert_to::create_block_height),
+                    parent_slot: blockinfo.parent_slot,
+                    parent_blockhash: blockinfo.parent_blockhash.to_string(),
+                    executed_transaction_count: blockinfo.executed_transaction_count,
+                    entries_count: blockinfo.entry_count,
+                    bank_id: *bank_id,
                 })
             }
-            Self::BlockMeta { blockinfo } => UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
-                slot: blockinfo.slot,
-                blockhash: blockinfo.blockhash.to_string(),
-                rewards: Some(convert_to::create_rewards_obj(
-                    &blockinfo.rewards.rewards,
-                    blockinfo.rewards.num_partitions,
-                )),
-                block_time: blockinfo.block_time.map(convert_to::create_timestamp),
-                block_height: blockinfo.block_height.map(convert_to::create_block_height),
-                parent_slot: blockinfo.parent_slot,
-                parent_blockhash: blockinfo.parent_blockhash.to_string(),
-                executed_transaction_count: blockinfo.executed_transaction_count,
-                entries_count: blockinfo.entry_count,
-            }),
-            Self::Entry { entry } => UpdateOneof::Entry(SubscribeUpdateEntry {
+            Self::Entry { bank_id, entry } => UpdateOneof::Entry(SubscribeUpdateEntry {
                 slot: entry.slot,
                 index: entry.index as u64,
                 num_hashes: entry.num_hashes,
                 hash: entry.hash.to_vec(),
                 executed_transaction_count: entry.executed_transaction_count,
                 starting_transaction_index: entry.starting_transaction_index as u64,
+                bank_id: *bank_id,
             }),
             Self::DeshredTransaction { slot, transaction } => {
                 return SubscribeUpdateRichat {
@@ -362,11 +383,11 @@ impl ProtobufMessage<'_> {
 
         // Tags of `SubscribeUpdateRichat` (100+) are the same as in Yellowstone `SubscribeUpdate`
         encode_raw! {
-            Self::Account { slot, account } => (2, encoding::Account::new(*slot, account)),
-            Self::Slot { slot, parent, status } => (3, encoding::Slot::new(*slot, *parent, status)),
-            Self::Transaction { slot, transaction } => (4, encoding::Transaction::new(*slot, transaction)),
-            Self::BlockMeta { blockinfo } => (7, encoding::BlockMeta::new(blockinfo)),
-            Self::Entry { entry } => (8, encoding::Entry::new(entry)),
+            Self::Account { slot, bank_id, account } => (2, encoding::Account::new(*slot, *bank_id, account)),
+            Self::Slot { slot, parent, status, bank_id } => (3, encoding::Slot::new(*slot, *parent, status, *bank_id)),
+            Self::Transaction { slot, bank_id, transaction } => (4, encoding::Transaction::new(*slot, *bank_id, transaction)),
+            Self::BlockMeta { bank_id, blockinfo } => (7, encoding::BlockMeta::new(blockinfo, *bank_id)),
+            Self::Entry { bank_id, entry } => (8, encoding::Entry::new(entry, *bank_id)),
             Self::DeshredTransaction { slot, transaction } => (100, encoding::DeshredTransaction::new(*slot, transaction)),
             Self::ContactInfo { info } => (101, encoding::ContactInfo::new(info)),
             Self::ContactInfoRemoved { pubkey } => (102, encoding::ContactInfoRemoved::new(pubkey)),

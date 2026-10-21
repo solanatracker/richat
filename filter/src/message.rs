@@ -3,7 +3,7 @@ use {
         LimitedDecode, SubscribeUpdateLimitedDecode, UpdateOneofLimitedDecode,
         UpdateOneofLimitedDecodeAccount, UpdateOneofLimitedDecodeEntry,
         UpdateOneofLimitedDecodeSlot, UpdateOneofLimitedDecodeTransaction,
-        UpdateOneofLimitedDecodeTransactionInfo,
+        UpdateOneofLimitedDecodeTransactionInfo, nonzero_bank_id,
     },
     prost::{
         Message as _,
@@ -12,17 +12,22 @@ use {
     },
     prost_types::Timestamp,
     richat_proto::{
-        convert_from,
+        convert_from, convert_to,
         geyser::{
-            SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta,
-            SubscribeUpdateEntry, SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
+            SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateBlockFooter,
+            SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateEntryUpdateParent,
+            SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
         },
-        richat::SubscribeUpdateRichat,
+        richat::{
+            SubscribeUpdateBlockFooter as SubscribeUpdateBlockFooterRichat,
+            SubscribeUpdateEntryUpdateParent as SubscribeUpdateEntryUpdateParentRichat,
+            SubscribeUpdateRichat, subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
+        },
         solana::storage::confirmed_block::{TransactionError, TransactionStatusMeta},
     },
     serde::{Deserialize, Serialize},
     solana_account::ReadableAccount,
-    solana_clock::{Epoch, Slot},
+    solana_clock::{BankId, Epoch, Slot},
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::{SIGNATURE_BYTES, Signature},
     solana_transaction_status::{
@@ -51,6 +56,8 @@ pub enum MessageParseError {
     InvalidUpdateMessage(&'static str),
     #[error("Incompatible encoding")]
     IncompatibleEncoding,
+    #[error("Invalid block footer: {0}")]
+    InvalidBlockFooter(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -70,6 +77,8 @@ pub enum MessageRef<'a> {
     Entry(&'a MessageEntry),
     BlockMeta(&'a MessageBlockMeta),
     Block(&'a MessageBlock),
+    BlockFooter(&'a MessageBlockFooter),
+    EntryUpdateParent(&'a MessageEntryUpdateParent),
 }
 
 impl<'a> From<&'a Message> for MessageRef<'a> {
@@ -81,6 +90,8 @@ impl<'a> From<&'a Message> for MessageRef<'a> {
             Message::Entry(msg) => Self::Entry(msg),
             Message::BlockMeta(msg) => Self::BlockMeta(msg),
             Message::Block(msg) => Self::Block(msg),
+            Message::BlockFooter(msg) => Self::BlockFooter(msg),
+            Message::EntryUpdateParent(msg) => Self::EntryUpdateParent(msg),
         }
     }
 }
@@ -94,6 +105,8 @@ pub enum Message {
     Entry(MessageEntry),
     BlockMeta(MessageBlockMeta),
     Block(MessageBlock),
+    BlockFooter(MessageBlockFooter),
+    EntryUpdateParent(MessageEntryUpdateParent),
 }
 
 impl Message {
@@ -160,6 +173,23 @@ impl Message {
             Self::Entry(msg) => msg.slot(),
             Self::BlockMeta(msg) => msg.slot(),
             Self::Block(msg) => msg.slot(),
+            Self::BlockFooter(msg) => msg.slot(),
+            Self::EntryUpdateParent(msg) => msg.slot(),
+        }
+    }
+
+    /// Bank of the message, `None` for messages not tied to a bank
+    /// (`FirstShredReceived` / `Completed` / `Dead` slot statuses, sources without Alpenglow support)
+    pub fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Slot(msg) => msg.bank_id(),
+            Self::Account(msg) => msg.bank_id(),
+            Self::Transaction(msg) => msg.bank_id(),
+            Self::Entry(msg) => msg.bank_id(),
+            Self::BlockMeta(msg) => msg.bank_id(),
+            Self::Block(msg) => msg.bank_id(),
+            Self::BlockFooter(msg) => msg.bank_id(),
+            Self::EntryUpdateParent(msg) => Some(msg.cleared_bank_id()),
         }
     }
 
@@ -171,6 +201,8 @@ impl Message {
             Self::Entry(msg) => msg.created_at(),
             Self::BlockMeta(msg) => msg.created_at(),
             Self::Block(msg) => msg.created_at(),
+            Self::BlockFooter(msg) => msg.created_at(),
+            Self::EntryUpdateParent(msg) => msg.created_at(),
         }
     }
 
@@ -182,7 +214,65 @@ impl Message {
             Self::Entry(msg) => msg.size(),
             Self::BlockMeta(msg) => msg.size(),
             Self::Block(msg) => msg.size(),
+            Self::BlockFooter(msg) => msg.size(),
+            Self::EntryUpdateParent(msg) => msg.size(),
         }
+    }
+
+    fn parse_richat(
+        update: SubscribeUpdateRichat,
+        size: usize,
+        encoding: MessageParserEncoding,
+    ) -> Result<Self, MessageParseError> {
+        let created_at = update
+            .created_at
+            .ok_or(MessageParseError::FieldNotDefined("created_at"))?;
+        match update.update_oneof {
+            Some(UpdateOneofRichat::BlockFooter(footer)) => {
+                Self::parse_richat_block_footer(footer, created_at, size, encoding)
+            }
+            Some(UpdateOneofRichat::EntryUpdateParent(update)) => Ok(
+                Self::parse_richat_entry_update_parent(update, created_at, size, encoding),
+            ),
+            Some(_) => Err(MessageParseError::InvalidUpdateMessage("Richat")),
+            None => Err(MessageParseError::FieldNotDefined("update_oneof")),
+        }
+    }
+
+    fn parse_richat_block_footer(
+        footer: SubscribeUpdateBlockFooterRichat,
+        created_at: Timestamp,
+        size: usize,
+        encoding: MessageParserEncoding,
+    ) -> Result<Self, MessageParseError> {
+        let footer = convert_to::create_block_footer_from_wincode(
+            footer.slot,
+            footer.bank_id,
+            &footer.footer,
+        )
+        .map_err(MessageParseError::InvalidBlockFooter)?;
+        Ok(Self::BlockFooter(MessageBlockFooter::new(
+            footer, created_at, size, encoding,
+        )))
+    }
+
+    fn parse_richat_entry_update_parent(
+        update: SubscribeUpdateEntryUpdateParentRichat,
+        created_at: Timestamp,
+        size: usize,
+        encoding: MessageParserEncoding,
+    ) -> Self {
+        Self::EntryUpdateParent(MessageEntryUpdateParent::new(
+            SubscribeUpdateEntryUpdateParent {
+                slot: update.slot,
+                cleared_bank_id: update.cleared_bank_id,
+                parent_slot: update.parent_slot,
+                parent_block_id: update.parent_block_id,
+            },
+            created_at,
+            size,
+            encoding,
+        ))
     }
 }
 
@@ -198,11 +288,17 @@ impl MessageParserLimited {
             .ok_or(MessageParseError::FieldNotDefined("created_at"))?;
 
         let Some(update_oneof) = update.update_oneof else {
-            return Err(if update.richat_update {
-                MessageParseError::InvalidUpdateMessage("Richat")
+            return if update.richat_update {
+                // Richat-only updates are rare (block footers / update parents), decode with prost
+                let size = data.len();
+                Message::parse_richat(
+                    SubscribeUpdateRichat::decode(data.as_slice())?,
+                    size,
+                    MessageParserEncoding::Limited,
+                )
             } else {
-                MessageParseError::FieldNotDefined("update_oneof")
-            });
+                Err(MessageParseError::FieldNotDefined("update_oneof"))
+            };
         };
 
         Ok(match update_oneof {
@@ -215,6 +311,7 @@ impl MessageParserLimited {
                     status: SlotStatus::try_from(message.status)
                         .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
                     dead_error: message.dead_error,
+                    bank_id: message.bank_id,
                     created_at,
                     buffer: data,
                     range,
@@ -246,6 +343,7 @@ impl MessageParserLimited {
                     write_version: message.write_version + range.start,
                     slot: message.slot,
                     is_startup: message.is_startup,
+                    bank_id: message.bank_id,
                     created_at,
                     buffer: data,
                     account_offset: message.account + range.start,
@@ -287,6 +385,7 @@ impl MessageParserLimited {
                     transaction_range,
                     transaction: OnceLock::new(),
                     slot: message.slot,
+                    bank_id: message.bank_id,
                     created_at,
                     buffer: data,
                     range,
@@ -303,6 +402,7 @@ impl MessageParserLimited {
                     slot: entry.slot,
                     index: entry.index,
                     executed_transaction_count: entry.executed_transaction_count,
+                    bank_id: entry.bank_id,
                     created_at,
                     buffer: data,
                     range,
@@ -334,6 +434,27 @@ impl MessageParserLimited {
             UpdateOneofLimitedDecode::Pong(_) => {
                 return Err(MessageParseError::InvalidUpdateMessage("Pong"));
             }
+            UpdateOneofLimitedDecode::BlockFooter(range) => {
+                let footer =
+                    SubscribeUpdateBlockFooter::decode(&data.as_slice()[range.start..range.end])?;
+                Message::BlockFooter(MessageBlockFooter::new(
+                    footer,
+                    created_at,
+                    data.len(),
+                    MessageParserEncoding::Limited,
+                ))
+            }
+            UpdateOneofLimitedDecode::EntryUpdateParent(range) => {
+                let update = SubscribeUpdateEntryUpdateParent::decode(
+                    &data.as_slice()[range.start..range.end],
+                )?;
+                Message::EntryUpdateParent(MessageEntryUpdateParent::new(
+                    update,
+                    created_at,
+                    data.len(),
+                    MessageParserEncoding::Limited,
+                ))
+            }
         })
     }
 }
@@ -352,12 +473,11 @@ impl MessageParserProst {
 
         let Some(update_oneof) = update.update_oneof else {
             // Yellowstone `SubscribeUpdate` skips Richat-only updates (tags `100+`)
-            let update = SubscribeUpdateRichat::decode(data.deref())?;
-            return Err(if update.update_oneof.is_some() {
-                MessageParseError::InvalidUpdateMessage("Richat")
-            } else {
-                MessageParseError::FieldNotDefined("update_oneof")
-            });
+            return Message::parse_richat(
+                SubscribeUpdateRichat::decode(data.deref())?,
+                encoded_len,
+                MessageParserEncoding::Prost,
+            );
         };
 
         Ok(match update_oneof {
@@ -367,6 +487,7 @@ impl MessageParserProst {
                 status: SlotStatus::try_from(message.status)
                     .map_err(|_| MessageParseError::InvalidEnumValue(message.status))?,
                 dead_error: message.dead_error,
+                bank_id: message.bank_id,
                 created_at,
                 size: encoded_len,
             }),
@@ -388,6 +509,7 @@ impl MessageParserProst {
                     account,
                     slot: message.slot,
                     is_startup: message.is_startup,
+                    bank_id: message.bank_id,
                     created_at,
                     size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 20,
                 })
@@ -409,6 +531,7 @@ impl MessageParserProst {
                     account_keys,
                     transaction,
                     slot: message.slot,
+                    bank_id: message.bank_id,
                     created_at,
                     size: encoded_len + SIGNATURE_BYTES + account_keys_capacity * PUBKEY_BYTES,
                 })
@@ -453,6 +576,7 @@ impl MessageParserProst {
                             account,
                             slot: message.slot,
                             is_startup: false,
+                            bank_id: nonzero_bank_id(message.bank_id),
                             created_at,
                             size: PUBKEY_BYTES + PUBKEY_BYTES + encoded_len + 32,
                         }))
@@ -477,6 +601,7 @@ impl MessageParserProst {
                             account_keys,
                             transaction,
                             slot: message.slot,
+                            bank_id: message.bank_id,
                             created_at,
                             size: encoded_len
                                 + SIGNATURE_BYTES
@@ -508,6 +633,7 @@ impl MessageParserProst {
                     parent_blockhash: message.parent_blockhash,
                     executed_transaction_count: message.executed_transaction_count,
                     entries_count: message.entries_count,
+                    bank_id: message.bank_id,
                 };
                 let encoded_len = block_meta.encoded_len();
                 let block_height = block_meta
@@ -534,6 +660,20 @@ impl MessageParserProst {
             UpdateOneof::Pong(_) => {
                 return Err(MessageParseError::InvalidUpdateMessage("Pong"));
             }
+            UpdateOneof::BlockFooter(footer) => Message::BlockFooter(MessageBlockFooter::new(
+                footer,
+                created_at,
+                encoded_len,
+                MessageParserEncoding::Prost,
+            )),
+            UpdateOneof::EntryUpdateParent(update) => {
+                Message::EntryUpdateParent(MessageEntryUpdateParent::new(
+                    update,
+                    created_at,
+                    encoded_len,
+                    MessageParserEncoding::Prost,
+                ))
+            }
         })
     }
 }
@@ -545,6 +685,7 @@ pub enum MessageSlot {
         parent: Option<Slot>,
         status: SlotStatus,
         dead_error: Option<Range<usize>>,
+        bank_id: Option<BankId>,
         created_at: Timestamp,
         buffer: Vec<u8>,
         range: Range<usize>,
@@ -554,6 +695,7 @@ pub enum MessageSlot {
         parent: Option<Slot>,
         status: SlotStatus,
         dead_error: Option<String>,
+        bank_id: Option<BankId>,
         created_at: Timestamp,
         size: usize,
     },
@@ -602,6 +744,14 @@ impl MessageSlot {
         }
     }
 
+    /// `None` for `FirstShredReceived`, `Completed` and `Dead` statuses
+    pub const fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Limited { bank_id, .. } => *bank_id,
+            Self::Prost { bank_id, .. } => *bank_id,
+        }
+    }
+
     pub fn dead_error(&self) -> Option<&str> {
         match self {
             Self::Limited {
@@ -629,6 +779,7 @@ pub enum MessageAccount {
         write_version: usize,
         slot: Slot,
         is_startup: bool,
+        bank_id: Option<BankId>,
         created_at: Timestamp,
         buffer: Vec<u8>,
         account_offset: usize,
@@ -640,6 +791,7 @@ pub enum MessageAccount {
         account: SubscribeUpdateAccountInfo,
         slot: Slot,
         is_startup: bool,
+        bank_id: Option<BankId>,
         created_at: Timestamp,
         size: usize,
     },
@@ -678,6 +830,14 @@ impl MessageAccount {
         match self {
             Self::Limited { pubkey, .. } => pubkey,
             Self::Prost { pubkey, .. } => pubkey,
+        }
+    }
+
+    /// `None` for startup accounts
+    pub const fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Limited { bank_id, .. } => *bank_id,
+            Self::Prost { bank_id, .. } => *bank_id,
         }
     }
 
@@ -855,6 +1015,7 @@ pub enum MessageTransaction {
         transaction_range: Range<usize>,
         transaction: OnceLock<Option<SubscribeUpdateTransactionInfo>>,
         slot: Slot,
+        bank_id: BankId,
         created_at: Timestamp,
         buffer: Vec<u8>,
         range: Range<usize>,
@@ -864,6 +1025,7 @@ pub enum MessageTransaction {
         account_keys: HashSet<Pubkey>,
         transaction: SubscribeUpdateTransactionInfo,
         slot: Slot,
+        bank_id: BankId,
         created_at: Timestamp,
         size: usize,
     },
@@ -976,6 +1138,13 @@ impl MessageTransaction {
         }
     }
 
+    pub const fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Limited { bank_id, .. } => nonzero_bank_id(*bank_id),
+            Self::Prost { bank_id, .. } => nonzero_bank_id(*bank_id),
+        }
+    }
+
     pub const fn failed(&self) -> bool {
         match self {
             Self::Limited { error, .. } => error.is_some(),
@@ -1038,6 +1207,7 @@ pub enum MessageEntry {
         slot: Slot,
         index: u64,
         executed_transaction_count: u64,
+        bank_id: BankId,
         created_at: Timestamp,
         buffer: Vec<u8>,
         range: Range<usize>,
@@ -1092,6 +1262,13 @@ impl MessageEntry {
                 ..
             } => *executed_transaction_count,
             Self::Prost { entry, .. } => entry.executed_transaction_count,
+        }
+    }
+
+    pub const fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Limited { bank_id, .. } => nonzero_bank_id(*bank_id),
+            Self::Prost { entry, .. } => nonzero_bank_id(entry.bank_id),
         }
     }
 }
@@ -1171,6 +1348,13 @@ impl MessageBlockMeta {
             Self::Prost { block_meta, .. } => block_meta.entries_count,
         }
     }
+
+    pub const fn bank_id(&self) -> Option<BankId> {
+        match self {
+            Self::Limited { block_meta, .. } => nonzero_bank_id(block_meta.bank_id),
+            Self::Prost { block_meta, .. } => nonzero_bank_id(block_meta.bank_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1189,6 +1373,10 @@ impl MessageBlock {
 
     pub fn slot(&self) -> Slot {
         self.block_meta.as_ref().slot()
+    }
+
+    pub fn bank_id(&self) -> Option<BankId> {
+        self.block_meta.as_ref().bank_id()
     }
 
     pub const fn created_at(&self) -> MessageBlockCreatedAt {
@@ -1275,6 +1463,103 @@ impl MessageBlock {
     }
 }
 
+/// Alpenglow block footer, always stored with certificates
+/// (stripped on encode when the filter does not request them)
+#[derive(Debug, Clone)]
+pub struct MessageBlockFooter {
+    footer: SubscribeUpdateBlockFooter,
+    created_at: MessageBlockCreatedAt,
+    size: usize,
+}
+
+impl MessageBlockFooter {
+    pub const fn new(
+        footer: SubscribeUpdateBlockFooter,
+        created_at: Timestamp,
+        size: usize,
+        encoding: MessageParserEncoding,
+    ) -> Self {
+        Self {
+            footer,
+            created_at: MessageBlockCreatedAt::new(created_at, encoding),
+            size,
+        }
+    }
+
+    pub const fn encoding(&self) -> MessageParserEncoding {
+        self.created_at.encoding()
+    }
+
+    pub const fn slot(&self) -> Slot {
+        self.footer.slot
+    }
+
+    pub const fn bank_id(&self) -> Option<BankId> {
+        nonzero_bank_id(self.footer.bank_id)
+    }
+
+    pub const fn created_at(&self) -> MessageBlockCreatedAt {
+        self.created_at
+    }
+
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+
+    pub const fn footer(&self) -> &SubscribeUpdateBlockFooter {
+        &self.footer
+    }
+}
+
+/// Alpenglow `UpdateParent` processed during replay: bank `cleared_bank_id` of the slot was
+/// cleared (all updates of that bank are invalid), the replacement bank is reported with
+/// `SlotStatus::CreatedBank`
+#[derive(Debug, Clone)]
+pub struct MessageEntryUpdateParent {
+    update: SubscribeUpdateEntryUpdateParent,
+    created_at: MessageBlockCreatedAt,
+    size: usize,
+}
+
+impl MessageEntryUpdateParent {
+    pub const fn new(
+        update: SubscribeUpdateEntryUpdateParent,
+        created_at: Timestamp,
+        size: usize,
+        encoding: MessageParserEncoding,
+    ) -> Self {
+        Self {
+            update,
+            created_at: MessageBlockCreatedAt::new(created_at, encoding),
+            size,
+        }
+    }
+
+    pub const fn encoding(&self) -> MessageParserEncoding {
+        self.created_at.encoding()
+    }
+
+    pub const fn slot(&self) -> Slot {
+        self.update.slot
+    }
+
+    pub const fn cleared_bank_id(&self) -> BankId {
+        self.update.cleared_bank_id
+    }
+
+    pub const fn created_at(&self) -> MessageBlockCreatedAt {
+        self.created_at
+    }
+
+    pub const fn size(&self) -> usize {
+        self.size
+    }
+
+    pub const fn update(&self) -> &SubscribeUpdateEntryUpdateParent {
+        &self.update
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageBlockCreatedAt {
     Limited(Timestamp),
@@ -1291,6 +1576,13 @@ impl From<MessageBlockCreatedAt> for Timestamp {
 }
 
 impl MessageBlockCreatedAt {
+    pub const fn new(created_at: Timestamp, encoding: MessageParserEncoding) -> Self {
+        match encoding {
+            MessageParserEncoding::Limited => Self::Limited(created_at),
+            MessageParserEncoding::Prost => Self::Prost(created_at),
+        }
+    }
+
     pub const fn encoding(&self) -> MessageParserEncoding {
         match self {
             Self::Limited(_) => MessageParserEncoding::Limited,
@@ -1312,7 +1604,7 @@ mod tests {
         super::{Message, MessageAccount, MessageParseError, MessageParserEncoding, MessageRef},
         crate::{
             config::{ConfigFilter, ConfigFilterAccounts, ConfigFilterAccountsDataSlice},
-            filter::Filter,
+            filter::{Filter, FilteredUpdate},
         },
         maplit::hashmap,
         solana_account::ReadableAccount,
@@ -1388,6 +1680,179 @@ mod tests {
                 ),
                 "unexpected result for {parser:?}"
             );
+        }
+    }
+
+    fn richat_footer_bytes() -> Vec<u8> {
+        // wincode `VersionedBlockFooter::V1` with a fast finalization cert only
+        let mut footer = vec![1];
+        footer.extend_from_slice(&[7; 32]); // bank_hash
+        footer.extend_from_slice(&42u64.to_le_bytes()); // block_producer_time_nanos
+        footer.push(0); // block_user_agent
+        footer.push(1); // block_final_cert
+        footer.extend_from_slice(&100u64.to_le_bytes());
+        footer.extend_from_slice(&[9; 32]);
+        footer.extend_from_slice(&[1; 96]);
+        footer.extend_from_slice(&1u16.to_le_bytes());
+        footer.push(0b101);
+        footer.push(0); // notar_aggregate
+        footer.push(0); // skip_reward_cert
+        footer.push(0); // notar_reward_cert
+        footer
+    }
+
+    #[test]
+    fn test_block_footer_and_update_parent() {
+        use {
+            crate::config::ConfigFilterBlockFooter,
+            maplit::hashset,
+            prost::Message as _,
+            richat_proto::{
+                geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
+                richat::{
+                    SubscribeUpdateBlockFooter, SubscribeUpdateEntryUpdateParent,
+                    SubscribeUpdateRichat,
+                    subscribe_update_richat::UpdateOneof as UpdateOneofRichat,
+                },
+            },
+        };
+
+        let created_at = prost_types::Timestamp {
+            seconds: 1_757_500_000,
+            nanos: 42,
+        };
+        let footer = SubscribeUpdateRichat {
+            update_oneof: Some(UpdateOneofRichat::BlockFooter(SubscribeUpdateBlockFooter {
+                slot: 101,
+                bank_id: 5,
+                version: 1,
+                bank_hash: vec![7; 32],
+                block_producer_time_nanos: 42,
+                block_user_agent: vec![],
+                footer: richat_footer_bytes(),
+            })),
+            created_at: Some(created_at),
+        }
+        .encode_to_vec();
+        let update_parent = SubscribeUpdateRichat {
+            update_oneof: Some(UpdateOneofRichat::EntryUpdateParent(
+                SubscribeUpdateEntryUpdateParent {
+                    slot: 101,
+                    cleared_bank_id: 5,
+                    parent_slot: 99,
+                    parent_block_id: vec![3; 32],
+                },
+            )),
+            created_at: Some(created_at),
+        }
+        .encode_to_vec();
+
+        let filter = Filter::new(&ConfigFilter {
+            entries: hashset! { "entry".to_owned(), "entry_parent".to_owned() },
+            entries_update_parent: hashset! { "entry_parent".to_owned() },
+            block_footer: hashmap! {
+                "footer".to_owned() => ConfigFilterBlockFooter::default(),
+                "footer_certs".to_owned() => ConfigFilterBlockFooter {
+                    include_certificates: Some(true),
+                },
+            },
+            ..Default::default()
+        });
+
+        for parser in [MessageParserEncoding::Limited, MessageParserEncoding::Prost] {
+            let message = Message::parse(footer.clone().into(), parser).expect("valid footer");
+            let Message::BlockFooter(msg) = &message else {
+                panic!("expected block footer for {parser:?}");
+            };
+            assert_eq!(msg.encoding(), parser);
+            assert_eq!(message.slot(), 101);
+            assert_eq!(message.bank_id(), Some(5));
+
+            let updates = filter.get_updates(&message, CommitmentLevel::Processed);
+            assert_eq!(updates.len(), 2, "{parser:?}");
+            for update in updates {
+                let update = SubscribeUpdate::decode(update.encode_to_vec().as_slice())
+                    .expect("valid update");
+                assert_eq!(update.created_at, Some(created_at));
+                let Some(UpdateOneof::BlockFooter(footer)) = update.update_oneof else {
+                    panic!("expected Yellowstone block footer");
+                };
+                assert_eq!((footer.slot, footer.bank_id), (101, 5));
+                assert_eq!(footer.bank_hash, vec![7; 32]);
+                assert_eq!(footer.block_producer_time_nanos, 42);
+                match update.filters.as_slice() {
+                    [name] if name == "footer" => assert_eq!(footer.block_final_cert, None),
+                    [name] if name == "footer_certs" => {
+                        let cert = footer.block_final_cert.expect("final cert");
+                        assert_eq!(cert.slot, 100);
+                        let aggregate = cert.final_aggregate.expect("final aggregate");
+                        assert_eq!(aggregate.block_id, vec![9; 32]);
+                        assert_eq!(aggregate.signer_bitmap, vec![0b101]);
+                    }
+                    filters => panic!("unexpected filters: {filters:?}"),
+                }
+            }
+
+            let message =
+                Message::parse(update_parent.clone().into(), parser).expect("valid update parent");
+            let Message::EntryUpdateParent(msg) = &message else {
+                panic!("expected entry update parent for {parser:?}");
+            };
+            assert_eq!((msg.slot(), msg.cleared_bank_id()), (101, 5));
+
+            let updates = filter.get_updates(&message, CommitmentLevel::Processed);
+            assert_eq!(updates.len(), 1, "{parser:?}");
+            let update = SubscribeUpdate::decode(updates[0].encode_to_vec().as_slice())
+                .expect("valid update");
+            assert_eq!(update.filters, vec!["entry_parent".to_owned()]);
+            let Some(UpdateOneof::EntryUpdateParent(update)) = update.update_oneof else {
+                panic!("expected Yellowstone entry update parent");
+            };
+            assert_eq!(update.cleared_bank_id, 5);
+            assert_eq!(update.parent_slot, 99);
+
+            // Yellowstone v14 encoding of the same messages (re-serve from another Richat)
+            for data in [footer.clone(), update_parent.clone()] {
+                let message = Message::parse(data.into(), parser).expect("valid message");
+                let data = FilteredUpdate {
+                    filters: Default::default(),
+                    filtered_update: MessageRef::from(&message).into(),
+                }
+                .encode_to_vec();
+                let message2 = Message::parse(data.into(), parser).expect("valid message");
+                assert_eq!(message2.slot(), message.slot());
+                assert_eq!(message2.bank_id(), message.bank_id());
+                assert_eq!(message2.size() > 0, message.size() > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_bank_id() {
+        use {
+            prost::Message as _,
+            richat_proto::geyser::{
+                SlotStatus, SubscribeUpdate, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+            },
+        };
+
+        for bank_id in [None, Some(0), Some(42)] {
+            let data = SubscribeUpdate {
+                filters: vec![],
+                update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot: 101,
+                    parent: Some(100),
+                    status: SlotStatus::SlotConfirmed as i32,
+                    dead_error: None,
+                    bank_id,
+                })),
+                created_at: Some(prost_types::Timestamp::default()),
+            }
+            .encode_to_vec();
+            for parser in [MessageParserEncoding::Limited, MessageParserEncoding::Prost] {
+                let message = Message::parse(data.clone().into(), parser).expect("valid slot");
+                assert_eq!(message.bank_id(), bank_id, "{parser:?}");
+            }
         }
     }
 

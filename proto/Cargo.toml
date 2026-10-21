@@ -17,6 +17,7 @@ prost-types = { workspace = true }
 solana-account = { workspace = true }
 solana-account-decoder = { workspace = true, features = ["agave-unstable-api"] }
 solana-clock = { workspace = true }
+solana-entry = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
@@ -25,6 +26,7 @@ solana-transaction = { workspace = true }
 solana-transaction-context = { workspace = true, features = ["agave-unstable-api"] }
 solana-transaction-error = { workspace = true }
 solana-transaction-status = { workspace = true, features = ["agave-unstable-api"] }
+wincode = { workspace = true }
 yellowstone-grpc-proto = { workspace = true }
 
 [build-dependencies]

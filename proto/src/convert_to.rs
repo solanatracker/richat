@@ -1,5 +1,6 @@
 use {
-    solana_clock::UnixTimestamp,
+    solana_clock::{BankId, Slot, UnixTimestamp},
+    solana_entry::block_component::{VersionedBlockFooter, VotesAggregate},
     solana_message::{
         MessageHeader, VersionedMessage, compiled_instruction::CompiledInstruction,
         v0::MessageAddressTableLookup, v1::TransactionConfig,
@@ -251,6 +252,7 @@ pub const fn create_reward_type(reward_type: Option<RewardType>) -> proto::Rewar
         Some(RewardType::Staking) => proto::RewardType::Staking,
         Some(RewardType::Voting) => proto::RewardType::Voting,
         Some(RewardType::DeactivatedStake) => proto::RewardType::DeactivatedStake,
+        Some(RewardType::VATDebit) => proto::RewardType::VatDebit,
     }
 }
 
@@ -271,4 +273,212 @@ pub const fn create_block_height(block_height: u64) -> proto::BlockHeight {
 
 pub const fn create_timestamp(timestamp: UnixTimestamp) -> proto::UnixTimestamp {
     proto::UnixTimestamp { timestamp }
+}
+
+/// Yellowstone `SubscribeUpdateBlockFooter` from a wincode-serialized `VersionedBlockFooter`
+/// (Richat-only `SubscribeUpdateBlockFooter.footer`).
+pub fn create_block_footer_from_wincode(
+    slot: Slot,
+    bank_id: BankId,
+    footer: &[u8],
+) -> Result<proto::SubscribeUpdateBlockFooter, &'static str> {
+    let footer = wincode::deserialize::<VersionedBlockFooter>(footer)
+        .map_err(|_| "failed to deserialize block footer")?;
+    create_block_footer(slot, bank_id, &footer)
+}
+
+/// Yellowstone `SubscribeUpdateBlockFooter` from `VersionedBlockFooter`, certificates are
+/// always included (filters strip them when `include_certificates` is not set).
+pub fn create_block_footer(
+    slot: Slot,
+    bank_id: BankId,
+    footer: &VersionedBlockFooter,
+) -> Result<proto::SubscribeUpdateBlockFooter, &'static str> {
+    let VersionedBlockFooter::V1(footer) = footer;
+    Ok(proto::SubscribeUpdateBlockFooter {
+        slot,
+        bank_id,
+        bank_hash: footer.bank_hash.to_bytes().into(),
+        block_producer_time_nanos: footer.block_producer_time_nanos,
+        block_user_agent: footer.block_user_agent.clone(),
+        block_final_cert: footer
+            .block_final_cert
+            .as_ref()
+            .map(|cert| {
+                // Fast finalization: `final_aggregate` alone, on the block.
+                // Slow finalization: `final_aggregate` on the slot, `notar_aggregate` on the block.
+                let block_id = cert.block_id.to_bytes().to_vec();
+                Ok::<_, &'static str>(match &cert.notar_aggregate {
+                    Some(notar_aggregate) => proto::BlockFooterFinalCert {
+                        slot: cert.slot,
+                        final_aggregate: Some(create_votes_aggregate(
+                            &cert.final_aggregate,
+                            vec![],
+                        )?),
+                        notar_aggregate: Some(create_votes_aggregate(notar_aggregate, block_id)?),
+                    },
+                    None => proto::BlockFooterFinalCert {
+                        slot: cert.slot,
+                        final_aggregate: Some(create_votes_aggregate(
+                            &cert.final_aggregate,
+                            block_id,
+                        )?),
+                        notar_aggregate: None,
+                    },
+                })
+            })
+            .transpose()?,
+        skip_reward_cert: footer.skip_reward_cert.as_ref().map(|cert| {
+            proto::BlockFooterSkipRewardCert {
+                slot: cert.slot,
+                aggregate: Some(proto::BlockFooterVotesAggregate {
+                    signature_kind: proto::BlockFooterSignatureKind::CompressedBls12381G2 as i32,
+                    signature: cert.signature.0.to_vec(),
+                    block_id: vec![],
+                    signer_bitmap: cert.to_bitmap().to_vec(),
+                }),
+            }
+        }),
+        notar_reward_cert: footer.notar_reward_cert.as_ref().map(|cert| {
+            proto::BlockFooterNotarRewardCert {
+                slot: cert.slot,
+                aggregate: Some(proto::BlockFooterVotesAggregate {
+                    signature_kind: proto::BlockFooterSignatureKind::CompressedBls12381G2 as i32,
+                    signature: cert.signature.0.to_vec(),
+                    block_id: cert.block_id.to_bytes().to_vec(),
+                    signer_bitmap: cert.bitmap().to_vec(),
+                }),
+            }
+        }),
+    })
+}
+
+fn create_votes_aggregate(
+    aggregate: &VotesAggregate,
+    block_id: Vec<u8>,
+) -> Result<proto::BlockFooterVotesAggregate, &'static str> {
+    // `VotesAggregate` does not expose the compressed signature, its wincode layout is
+    // `[u8; 96]` compressed signature followed by `u16` LE bitmap length and the bitmap.
+    const SIGNATURE_SIZE: usize = 96;
+    let bitmap = aggregate.clone().into_bitmap();
+    let bytes = wincode::serialize(aggregate).map_err(|_| "failed to serialize votes aggregate")?;
+    if bytes.len() != SIGNATURE_SIZE + 2 + bitmap.len() || bytes[SIGNATURE_SIZE + 2..] != bitmap {
+        return Err("unexpected votes aggregate layout");
+    }
+    Ok(proto::BlockFooterVotesAggregate {
+        signature_kind: proto::BlockFooterSignatureKind::CompressedBls12381G2 as i32,
+        signature: bytes[..SIGNATURE_SIZE].to_vec(),
+        block_id,
+        signer_bitmap: bitmap,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{create_block_footer, create_block_footer_from_wincode},
+        crate::geyser::BlockFooterSignatureKind,
+        solana_entry::block_component::VersionedBlockFooter,
+    };
+
+    const KIND: i32 = BlockFooterSignatureKind::CompressedBls12381G2 as i32;
+
+    fn votes_aggregate(signature: u8, bitmap: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![signature; 96];
+        bytes.extend_from_slice(&(bitmap.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(bitmap);
+        bytes
+    }
+
+    // wincode layout of `VersionedBlockFooter::V1`, bitmaps of reward certs are `ShortU16`
+    // length-prefixed (one byte for lengths below 128)
+    fn footer(slow: bool) -> Vec<u8> {
+        let mut bytes = vec![1]; // V1
+        bytes.extend_from_slice(&[7; 32]); // bank_hash
+        bytes.extend_from_slice(&42u64.to_le_bytes()); // block_producer_time_nanos
+        bytes.push(5);
+        bytes.extend_from_slice(b"agave"); // block_user_agent
+        // block_final_cert
+        bytes.push(1);
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&[9; 32]); // block_id
+        bytes.extend_from_slice(&votes_aggregate(1, &[0b101, 0b1]));
+        if slow {
+            bytes.push(1);
+            bytes.extend_from_slice(&votes_aggregate(2, &[0b11]));
+        } else {
+            bytes.push(0);
+        }
+        // skip_reward_cert
+        bytes.push(1);
+        bytes.extend_from_slice(&98u64.to_le_bytes());
+        bytes.extend_from_slice(&[3; 96]);
+        bytes.extend_from_slice(&[1, 0b111]);
+        // notar_reward_cert
+        bytes.push(1);
+        bytes.extend_from_slice(&99u64.to_le_bytes());
+        bytes.extend_from_slice(&[8; 32]);
+        bytes.extend_from_slice(&[4; 96]);
+        bytes.extend_from_slice(&[2, 0b1, 0b10]);
+        bytes
+    }
+
+    #[test]
+    fn test_block_footer_certificates() {
+        for slow in [false, true] {
+            let bytes = footer(slow);
+            let decoded = wincode::deserialize::<VersionedBlockFooter>(&bytes).expect("decode");
+            assert_eq!(wincode::serialize(&decoded).expect("encode"), bytes);
+
+            let footer = create_block_footer_from_wincode(101, 7, &bytes).expect("convert");
+            assert_eq!(
+                footer,
+                create_block_footer(101, 7, &decoded).expect("convert")
+            );
+            assert_eq!(footer.slot, 101);
+            assert_eq!(footer.bank_id, 7);
+            assert_eq!(footer.bank_hash, vec![7; 32]);
+            assert_eq!(footer.block_producer_time_nanos, 42);
+            assert_eq!(footer.block_user_agent, b"agave");
+
+            let cert = footer.block_final_cert.expect("final cert");
+            assert_eq!(cert.slot, 100);
+            let final_aggregate = cert.final_aggregate.expect("final aggregate");
+            assert_eq!(final_aggregate.signature_kind, KIND);
+            assert_eq!(final_aggregate.signature, vec![1; 96]);
+            assert_eq!(final_aggregate.signer_bitmap, vec![0b101, 0b1]);
+            if slow {
+                // finalization vote is on the slot, notarization on the block
+                assert!(final_aggregate.block_id.is_empty());
+                let notar_aggregate = cert.notar_aggregate.expect("notar aggregate");
+                assert_eq!(notar_aggregate.signature, vec![2; 96]);
+                assert_eq!(notar_aggregate.block_id, vec![9; 32]);
+                assert_eq!(notar_aggregate.signer_bitmap, vec![0b11]);
+            } else {
+                assert_eq!(final_aggregate.block_id, vec![9; 32]);
+                assert_eq!(cert.notar_aggregate, None);
+            }
+
+            let skip = footer.skip_reward_cert.expect("skip reward cert");
+            assert_eq!(skip.slot, 98);
+            let skip = skip.aggregate.expect("aggregate");
+            assert_eq!(skip.signature_kind, KIND);
+            assert_eq!(skip.signature, vec![3; 96]);
+            assert!(skip.block_id.is_empty());
+            assert_eq!(skip.signer_bitmap, vec![0b111]);
+
+            let notar = footer.notar_reward_cert.expect("notar reward cert");
+            assert_eq!(notar.slot, 99);
+            let notar = notar.aggregate.expect("aggregate");
+            assert_eq!(notar.signature, vec![4; 96]);
+            assert_eq!(notar.block_id, vec![8; 32]);
+            assert_eq!(notar.signer_bitmap, vec![0b1, 0b10]);
+        }
+    }
+
+    #[test]
+    fn test_block_footer_invalid() {
+        assert!(create_block_footer_from_wincode(1, 1, &[]).is_err());
+        assert!(create_block_footer_from_wincode(1, 1, &[2]).is_err());
+    }
 }

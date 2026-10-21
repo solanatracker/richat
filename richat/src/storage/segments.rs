@@ -151,6 +151,8 @@ fn payload_identity(message: &ParsedMessage) -> (PayloadIdentity, PayloadAllocat
         ParsedMessage::Entry(message) => identity(3, message),
         ParsedMessage::BlockMeta(message) => identity(4, message),
         ParsedMessage::Block(message) => identity(5, message),
+        ParsedMessage::BlockFooter(message) => identity(6, message),
+        ParsedMessage::EntryUpdateParent(message) => identity(7, message),
     }
 }
 
@@ -902,6 +904,7 @@ mod tests {
                 parent: Some(slot - 1),
                 status: SlotStatus::SlotProcessed as i32,
                 dead_error: None,
+                bank_id: None,
             })),
             created_at: Some(prost_types::Timestamp {
                 seconds: 1,

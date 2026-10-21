@@ -448,6 +448,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzTransactionMessage| {
 
     let message = ProtobufMessage::Transaction {
         slot: fuzz_message.slot,
+        bank_id: fuzz_message.slot,
         transaction: &replica,
     };
     let created_at = SystemTime::now();

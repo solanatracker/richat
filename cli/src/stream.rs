@@ -8,7 +8,8 @@ use {
     richat_proto::{
         convert_from,
         geyser::{
-            SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
+            BlockFooterVotesAggregate, SlotStatus, SubscribeUpdate, SubscribeUpdateAccountInfo,
+            SubscribeUpdateBlock, SubscribeUpdateBlockFooter as GeyserSubscribeUpdateBlockFooter,
             SubscribeUpdateBlockMeta, SubscribeUpdateContactInfoNode,
             SubscribeUpdateDeshredTransactionInfo, SubscribeUpdateEntry,
             SubscribeUpdateTransactionInfo, subscribe_update::UpdateOneof,
@@ -187,6 +188,10 @@ pub async fn handle_stream(
                 Some(UpdateOneof::Block(_)) => (&mut pb_blocks_c, &pb_blocks),
                 Some(UpdateOneof::Ping(_)) => (&mut pb_pp_c, &pb_pp),
                 Some(UpdateOneof::Pong(_)) => (&mut pb_pp_c, &pb_pp),
+                Some(UpdateOneof::BlockFooter(_)) => (&mut pb_blocks_ft_c, &pb_blocks_ft),
+                Some(UpdateOneof::EntryUpdateParent(_)) => {
+                    (&mut pb_update_parents_c, &pb_update_parents)
+                }
                 None => {
                     pb_multi.println("update not found in the message")?;
                     break;
@@ -212,6 +217,7 @@ pub async fn handle_stream(
                 let mut value = create_pretty_account(account)?;
                 value["isStartup"] = json!(msg.is_startup);
                 value["slot"] = json!(msg.slot);
+                value["bankId"] = json!(msg.bank_id);
                 print_update("account", created_at, &filters, value);
             }
             Some(UpdateOneof::Slot(msg)) => {
@@ -226,6 +232,7 @@ pub async fn handle_stream(
                         "parent": msg.parent,
                         "status": status.as_str_name(),
                         "deadError": msg.dead_error,
+                        "bankId": msg.bank_id,
                     }),
                 );
             }
@@ -235,6 +242,7 @@ pub async fn handle_stream(
                     .ok_or(anyhow::anyhow!("no transaction in the message"))?;
                 let mut value = create_pretty_transaction(tx)?;
                 value["slot"] = json!(msg.slot);
+                value["bankId"] = json!(msg.bank_id);
                 print_update("transaction", created_at, &filters, value);
             }
             Some(UpdateOneof::TransactionStatus(msg)) => {
@@ -244,6 +252,7 @@ pub async fn handle_stream(
                     &filters,
                     json!({
                         "slot": msg.slot,
+                        "bankId": msg.bank_id,
                         "signature": Signature::try_from(msg.signature.as_slice()).context("invalid signature")?.to_string(),
                         "isVote": msg.is_vote,
                         "index": msg.index,
@@ -266,6 +275,27 @@ pub async fn handle_stream(
             }
             Some(UpdateOneof::Block(msg)) => {
                 print_update("block", created_at, &filters, create_pretty_block(msg)?);
+            }
+            Some(UpdateOneof::BlockFooter(msg)) => {
+                print_update(
+                    "blockFooter",
+                    created_at,
+                    &filters,
+                    create_pretty_geyser_block_footer(msg)?,
+                );
+            }
+            Some(UpdateOneof::EntryUpdateParent(msg)) => {
+                print_update(
+                    "entryUpdateParent",
+                    created_at,
+                    &filters,
+                    json!({
+                        "slot": msg.slot,
+                        "clearedBankId": msg.cleared_bank_id,
+                        "parentSlot": msg.parent_slot,
+                        "parentBlockId": create_pretty_hash(&msg.parent_block_id, "parent block id")?,
+                    }),
+                );
             }
             Some(UpdateOneof::Ping(_)) => {}
             Some(UpdateOneof::Pong(_)) => {}
@@ -351,12 +381,14 @@ fn create_pretty_entry(msg: SubscribeUpdateEntry) -> anyhow::Result<Value> {
         "hash": Hash::new_from_array(<[u8; 32]>::try_from(msg.hash.as_slice()).context("invalid entry hash")?).to_string(),
         "executedTransactionCount": msg.executed_transaction_count,
         "startingTransactionIndex": msg.starting_transaction_index,
+        "bankId": msg.bank_id,
     }))
 }
 
 fn create_pretty_blockmeta(msg: SubscribeUpdateBlockMeta) -> anyhow::Result<Value> {
     Ok(json!({
         "slot": msg.slot,
+        "bankId": msg.bank_id,
         "blockhash": msg.blockhash,
         "rewards": if let Some(rewards) = msg.rewards {
             Some(convert_from::create_rewards_obj(rewards).map_err(|error| anyhow::anyhow!(error))?)
@@ -375,6 +407,7 @@ fn create_pretty_blockmeta(msg: SubscribeUpdateBlockMeta) -> anyhow::Result<Valu
 fn create_pretty_block(msg: SubscribeUpdateBlock) -> anyhow::Result<Value> {
     Ok(json!({
         "slot": msg.slot,
+        "bankId": msg.bank_id,
         "blockhash": msg.blockhash,
         "rewards": if let Some(rewards) = msg.rewards {
             Some(convert_from::create_rewards_obj(rewards).map_err(|error| anyhow::anyhow!(error))?)
@@ -498,6 +531,49 @@ fn create_pretty_block_footer(msg: SubscribeUpdateBlockFooter) -> anyhow::Result
         "blockProducerTimeNanos": msg.block_producer_time_nanos,
         "blockUserAgent": String::from_utf8_lossy(&msg.block_user_agent),
         "footer": const_hex::encode(msg.footer),
+    }))
+}
+
+fn create_pretty_geyser_block_footer(
+    msg: GeyserSubscribeUpdateBlockFooter,
+) -> anyhow::Result<Value> {
+    let aggregate = |aggregate: Option<BlockFooterVotesAggregate>| -> anyhow::Result<Value> {
+        let Some(aggregate) = aggregate else {
+            return Ok(Value::Null);
+        };
+        Ok(json!({
+            "signatureKind": aggregate.signature_kind().as_str_name(),
+            "signature": const_hex::encode(aggregate.signature),
+            "blockId": if aggregate.block_id.is_empty() {
+                Value::Null
+            } else {
+                json!(create_pretty_hash(&aggregate.block_id, "block id")?)
+            },
+            "signerBitmap": const_hex::encode(aggregate.signer_bitmap),
+        }))
+    };
+    Ok(json!({
+        "slot": msg.slot,
+        "bankId": msg.bank_id,
+        "bankHash": create_pretty_hash(&msg.bank_hash, "bank hash")?,
+        "blockProducerTimeNanos": msg.block_producer_time_nanos,
+        "blockUserAgent": String::from_utf8_lossy(&msg.block_user_agent),
+        "blockFinalCert": match msg.block_final_cert {
+            Some(cert) => json!({
+                "slot": cert.slot,
+                "finalAggregate": aggregate(cert.final_aggregate)?,
+                "notarAggregate": aggregate(cert.notar_aggregate)?,
+            }),
+            None => Value::Null,
+        },
+        "skipRewardCert": match msg.skip_reward_cert {
+            Some(cert) => json!({ "slot": cert.slot, "aggregate": aggregate(cert.aggregate)? }),
+            None => Value::Null,
+        },
+        "notarRewardCert": match msg.notar_reward_cert {
+            Some(cert) => json!({ "slot": cert.slot, "aggregate": aggregate(cert.aggregate)? }),
+            None => Value::Null,
+        },
     }))
 }
 

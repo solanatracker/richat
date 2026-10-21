@@ -59,6 +59,7 @@ mod tests {
             let (slot, replica) = item.to_replica();
             let msg_richat = ProtobufMessage::Account {
                 slot,
+                bank_id: item.bank_id,
                 account: &replica,
             };
             let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
@@ -81,6 +82,7 @@ mod tests {
         for item in generate_block_metas() {
             let replica = item.to_replica();
             let msg_richat = ProtobufMessage::BlockMeta {
+                bank_id: item.bank_id,
                 blockinfo: &replica,
             };
             let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
@@ -102,7 +104,10 @@ mod tests {
         let created_at = SystemTime::now();
         for item in generate_entries() {
             let replica = item.to_replica();
-            let msg_richat = ProtobufMessage::Entry { entry: &replica };
+            let msg_richat = ProtobufMessage::Entry {
+                bank_id: item.bank_id,
+                entry: &replica,
+            };
             let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
             let vec_richat2 = msg_richat.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
             assert_eq!(vec_richat1, vec_richat2, "entry: {item:?}");
@@ -126,6 +131,7 @@ mod tests {
                 slot,
                 parent,
                 status,
+                bank_id: item.bank_id,
             };
             let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
             let vec_richat2 = msg_richat.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
@@ -148,6 +154,7 @@ mod tests {
             let (slot, replica) = item.to_replica();
             let msg_richat = ProtobufMessage::Transaction {
                 slot,
+                bank_id: item.bank_id,
                 transaction: &replica,
             };
             let vec_richat1 = msg_richat.encode_with_timestamp(ProtobufEncoder::Prost, created_at);

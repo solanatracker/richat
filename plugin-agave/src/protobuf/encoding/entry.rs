@@ -6,16 +6,18 @@ use {
         bytes::{Buf, BufMut},
         encoding::{self, DecodeContext, WireType},
     },
+    solana_clock::BankId,
 };
 
 #[derive(Debug)]
 pub struct Entry<'a> {
     entry: &'a ReplicaEntryInfoV2<'a>,
+    bank_id: BankId,
 }
 
 impl<'a> Entry<'a> {
-    pub const fn new(entry: &'a ReplicaEntryInfoV2<'a>) -> Self {
-        Self { entry }
+    pub const fn new(entry: &'a ReplicaEntryInfoV2<'a>, bank_id: BankId) -> Self {
+        Self { entry, bank_id }
     }
 }
 
@@ -39,6 +41,9 @@ impl Message for Entry<'_> {
         }
         if starting_transaction_index != 0 {
             encoding::uint64::encode(6, &starting_transaction_index, buf);
+        }
+        if self.bank_id != 0 {
+            encoding::uint64::encode(7, &self.bank_id, buf);
         }
     }
 
@@ -66,6 +71,11 @@ impl Message for Entry<'_> {
             }
             + if starting_transaction_index != 0 {
                 encoding::uint64::encoded_len(6, &starting_transaction_index)
+            } else {
+                0
+            }
+            + if self.bank_id != 0 {
+                encoding::uint64::encoded_len(7, &self.bank_id)
             } else {
                 0
             }

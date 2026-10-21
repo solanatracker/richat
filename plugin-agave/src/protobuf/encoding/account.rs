@@ -6,7 +6,7 @@ use {
         bytes::{Buf, BufMut},
         encoding::{self, DecodeContext, WireType},
     },
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     std::ops::Deref,
 };
 
@@ -104,11 +104,20 @@ impl Message for ReplicaWrapper<'_> {
 pub struct Account<'a> {
     account: &'a ReplicaAccountInfoV3<'a>,
     slot: Slot,
+    bank_id: Option<BankId>,
 }
 
 impl<'a> Account<'a> {
-    pub const fn new(slot: Slot, account: &'a ReplicaAccountInfoV3<'a>) -> Self {
-        Self { slot, account }
+    pub const fn new(
+        slot: Slot,
+        bank_id: Option<BankId>,
+        account: &'a ReplicaAccountInfoV3<'a>,
+    ) -> Self {
+        Self {
+            slot,
+            bank_id,
+            account,
+        }
     }
 }
 
@@ -118,6 +127,9 @@ impl Message for Account<'_> {
         encoding::message::encode(1, &wrapper, buf);
         if self.slot != 0 {
             encoding::uint64::encode(2, &self.slot, buf)
+        }
+        if let Some(value) = &self.bank_id {
+            encoding::uint64::encode(4, value, buf)
         }
     }
 
@@ -129,6 +141,10 @@ impl Message for Account<'_> {
             } else {
                 0
             }
+            + self
+                .bank_id
+                .as_ref()
+                .map_or(0, |value| encoding::uint64::encoded_len(4, value))
     }
 
     fn merge_field(

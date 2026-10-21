@@ -39,7 +39,7 @@ impl Default for ConfigAppsGrpcWorkers {
     fn default() -> Self {
         Self {
             threads: ConfigAppsWorkers::default(),
-            messages_cached_max: 1_024,
+            messages_cached_max: 16_384,
             ticks_without_messages_max: None,
         }
     }

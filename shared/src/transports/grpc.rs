@@ -61,6 +61,16 @@ pub struct ConfigGrpcCompression {
 }
 
 impl ConfigGrpcCompression {
+    /// Server accepts and sends gzip and zstd, like Yellowstone gRPC. A server compresses
+    /// responses only when the client asks for it, so this is safe for every client.
+    pub fn server_default() -> Self {
+        let encodings = vec![CompressionEncoding::Gzip, CompressionEncoding::Zstd];
+        Self {
+            accept: encodings.clone(),
+            send: encodings,
+        }
+    }
+
     pub fn deserialize_compression<'de, D>(
         deserializer: D,
     ) -> Result<Vec<CompressionEncoding>, D::Error>
@@ -109,7 +119,7 @@ impl Default for ConfigGrpcServer {
         Self {
             endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 10100),
             tls_config: None,
-            compression: ConfigGrpcCompression::default(),
+            compression: ConfigGrpcCompression::server_default(),
             max_decoding_message_size: 4 * 1024 * 1024, // 4MiB
             server_tcp_keepalive: Some(Duration::from_secs(15)),
             server_tcp_nodelay: true,
@@ -475,4 +485,31 @@ fn from_decode_error(error: prost::DecodeError) -> Status {
     // Map Protobuf parse errors to an INTERNAL status code, as per
     // https://github.com/grpc/grpc/blob/master/doc/statuscodes.md
     Status::new(tonic::Code::Internal, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{ConfigGrpcCompression, ConfigGrpcServer},
+        tonic::codec::CompressionEncoding,
+    };
+
+    #[test]
+    fn server_compression_defaults_to_gzip_and_zstd() {
+        let config: ConfigGrpcServer = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.compression, ConfigGrpcCompression::server_default());
+        assert_eq!(
+            config.compression.send,
+            [CompressionEncoding::Gzip, CompressionEncoding::Zstd]
+        );
+        assert_eq!(config.compression.accept, config.compression.send);
+
+        // explicit empty lists disable compression
+        let config: ConfigGrpcServer =
+            serde_json::from_str(r#"{"compression": {"accept": [], "send": []}}"#).unwrap();
+        assert!(config.compression.accept.is_empty() && config.compression.send.is_empty());
+
+        // clients keep sending uncompressed requests unless configured
+        assert_eq!(ConfigGrpcCompression::default().send, []);
+    }
 }

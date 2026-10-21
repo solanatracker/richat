@@ -20,9 +20,9 @@ use {
     richat_proto::{
         geyser::{
             CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
-            SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
-            SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
-            SubscribeRequestFilterTransactions,
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterBlockFooter,
+            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
+            SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
         },
         richat::{GrpcSubscribeRequest, RichatFilter},
     },
@@ -430,11 +430,12 @@ impl Subscription {
             disable_accounts,
             disable_transactions: false,
             disable_entries: false,
-            // Richat-only messages are not supported yet
+            // other Richat-only messages are not supported yet
             enable_deshred_transactions: false,
             enable_contact_info: false,
-            enable_block_footers: false,
-            enable_entry_update_parents: false,
+            // Alpenglow: footers and cleared banks (requires plugin notifications)
+            enable_block_footers: true,
+            enable_entry_update_parents: true,
         })
     }
 
@@ -456,7 +457,12 @@ impl Subscription {
             transactions_status: HashMap::new(),
             blocks: HashMap::new(),
             blocks_meta: hashmap! { "".to_owned() => SubscribeRequestFilterBlocksMeta::default() },
-            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry::default() },
+            entry: hashmap! { "".to_owned() => SubscribeRequestFilterEntry {
+                include_update_parent: Some(true),
+            } },
+            block_footer: hashmap! { "".to_owned() => SubscribeRequestFilterBlockFooter {
+                include_certificates: Some(true),
+            } },
             commitment: Some(CommitmentLevelProto::Processed as i32),
             accounts_data_slice: vec![],
             ping: None,

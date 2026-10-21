@@ -18,7 +18,7 @@ pub fn bench_encode_entries(criterion: &mut Criterion) {
                 #[allow(clippy::unit_arg)]
                 black_box({
                     for entry in entries {
-                        let message = ProtobufMessage::Entry { entry };
+                        let message = ProtobufMessage::Entry { bank_id: 42, entry };
                         message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
                     }
                 })
@@ -30,7 +30,7 @@ pub fn bench_encode_entries(criterion: &mut Criterion) {
                 #[allow(clippy::unit_arg)]
                 black_box({
                     for entry in entries {
-                        let message = ProtobufMessage::Entry { entry };
+                        let message = ProtobufMessage::Entry { bank_id: 42, entry };
                         message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
                     }
                 })

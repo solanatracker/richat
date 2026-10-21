@@ -5,7 +5,7 @@ use {
         encoding::{self, DecodeContext, WireType, check_wire_type, decode_key, decode_varint},
     },
     prost_types::Timestamp,
-    solana_clock::{Epoch, Slot},
+    solana_clock::{BankId, Epoch, Slot},
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::SIGNATURE_BYTES,
     std::{borrow::Cow, collections::HashSet, mem::MaybeUninit, ops::Range},
@@ -47,6 +47,12 @@ fn decode_pubkey(
     let mut pubkey = MaybeUninit::<[u8; PUBKEY_BYTES]>::uninit();
     buf.copy_to_slice(unsafe { &mut *pubkey.as_mut_ptr() });
     Ok(unsafe { pubkey.assume_init() }.into())
+}
+
+/// Yellowstone uses `0` for messages without bank in non-optional `bank_id` fields
+#[inline]
+pub const fn nonzero_bank_id(bank_id: BankId) -> Option<BankId> {
+    if bank_id == 0 { None } else { Some(bank_id) }
 }
 
 pub trait LimitedDecode: Default {
@@ -100,7 +106,7 @@ impl LimitedDecode for SubscribeUpdateLimitedDecode {
                 Ok(())
             }
             #[allow(clippy::manual_range_patterns)]
-            2u32 | 3u32 | 4u32 | 10u32 | 5u32 | 6u32 | 9u32 | 7u32 | 8u32 => {
+            2u32 | 3u32 | 4u32 | 10u32 | 5u32 | 6u32 | 9u32 | 7u32 | 8u32 | 12u32 | 13u32 => {
                 let value = &mut self.update_oneof;
                 UpdateOneofLimitedDecode::merge(value, tag, buf, buf_len).map_err(|mut error| {
                     error.push(STRUCT_NAME, "update_oneof");
@@ -150,6 +156,8 @@ pub enum UpdateOneofLimitedDecode {
     Pong(Range<usize>),
     BlockMeta(Range<usize>),
     Entry(Range<usize>),
+    BlockFooter(Range<usize>),
+    EntryUpdateParent(Range<usize>),
 }
 
 impl UpdateOneofLimitedDecode {
@@ -235,6 +243,22 @@ impl UpdateOneofLimitedDecode {
                     Ok(())
                 }
             },
+            12u32 => match field {
+                Some(Self::BlockFooter(_)) => Err(create_decode_error("merge is not supported")),
+                _ => {
+                    *field = Some(Self::BlockFooter(range));
+                    Ok(())
+                }
+            },
+            13u32 => match field {
+                Some(Self::EntryUpdateParent(_)) => {
+                    Err(create_decode_error("merge is not supported"))
+                }
+                _ => {
+                    *field = Some(Self::EntryUpdateParent(range));
+                    Ok(())
+                }
+            },
             _ => unreachable!(),
         }
     }
@@ -253,6 +277,7 @@ pub struct UpdateOneofLimitedDecodeAccount {
     pub write_version: usize,
     pub slot: Slot,
     pub is_startup: bool,
+    pub bank_id: Option<BankId>,
 }
 
 impl Default for UpdateOneofLimitedDecodeAccount {
@@ -269,6 +294,7 @@ impl Default for UpdateOneofLimitedDecodeAccount {
             write_version: usize::default(),
             slot: Slot::default(),
             is_startup: bool::default(),
+            bank_id: None,
         }
     }
 }
@@ -303,6 +329,19 @@ impl LimitedDecode for UpdateOneofLimitedDecodeAccount {
                 let value = &mut self.is_startup;
                 encoding::bool::merge(wire_type, value, buf, ctx).map_err(|mut error| {
                     error.push(STRUCT_NAME, "is_startup");
+                    error
+                })
+            }
+            4u32 => {
+                let value = &mut self.bank_id;
+                encoding::uint64::merge(
+                    wire_type,
+                    value.get_or_insert_with(Default::default),
+                    buf,
+                    ctx,
+                )
+                .map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
                     error
                 })
             }
@@ -421,6 +460,7 @@ pub struct UpdateOneofLimitedDecodeSlot {
     pub parent: Option<Slot>,
     pub status: i32,
     pub dead_error: Option<Range<usize>>,
+    pub bank_id: Option<BankId>,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
@@ -477,6 +517,19 @@ impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
                 self.dead_error = Some(Range { start, end });
                 Ok(())
             }
+            5u32 => {
+                let value = &mut self.bank_id;
+                encoding::uint64::merge(
+                    wire_type,
+                    value.get_or_insert_with(Default::default),
+                    buf,
+                    ctx,
+                )
+                .map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
+                    error
+                })
+            }
             _ => encoding::skip_field(wire_type, tag, buf, ctx),
         }
     }
@@ -486,6 +539,7 @@ impl LimitedDecode for UpdateOneofLimitedDecodeSlot {
 pub struct UpdateOneofLimitedDecodeTransaction {
     pub transaction: Option<Range<usize>>,
     pub slot: Slot,
+    pub bank_id: BankId,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeTransaction {
@@ -519,6 +573,13 @@ impl LimitedDecode for UpdateOneofLimitedDecodeTransaction {
                 let value = &mut self.slot;
                 encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
                     error.push(STRUCT_NAME, "slot");
+                    error
+                })
+            }
+            3u32 => {
+                let value = &mut self.bank_id;
+                encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
                     error
                 })
             }
@@ -712,6 +773,7 @@ pub struct UpdateOneofLimitedDecodeEntry {
     pub slot: Slot,
     pub index: u64,
     pub executed_transaction_count: u64,
+    pub bank_id: BankId,
 }
 
 impl LimitedDecode for UpdateOneofLimitedDecodeEntry {
@@ -768,6 +830,13 @@ impl LimitedDecode for UpdateOneofLimitedDecodeEntry {
                 error.push(STRUCT_NAME, "starting_transaction_index");
                 error
             }),
+            7u32 => {
+                let value = &mut self.bank_id;
+                encoding::uint64::merge(wire_type, value, buf, ctx).map_err(|mut error| {
+                    error.push(STRUCT_NAME, "bank_id");
+                    error
+                })
+            }
             _ => encoding::skip_field(wire_type, tag, buf, ctx),
         }
     }

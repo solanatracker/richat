@@ -23,6 +23,7 @@ pub fn bench_encode_accounts(criterion: &mut Criterion) {
                     for (slot, account) in accounts {
                         let message = ProtobufMessage::Account {
                             slot: *slot,
+                            bank_id: Some(42),
                             account,
                         };
                         message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
@@ -38,6 +39,7 @@ pub fn bench_encode_accounts(criterion: &mut Criterion) {
                     for (slot, account) in accounts {
                         let message = ProtobufMessage::Account {
                             slot: *slot,
+                            bank_id: Some(42),
                             account,
                         };
                         message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);

@@ -10,7 +10,7 @@ use {
     },
     prost_types::Timestamp,
     richat_proto::{geyser::subscribe_update::UpdateOneof, solana::storage::confirmed_block},
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_pubkey::Pubkey,
     std::borrow::Cow,
 };
@@ -124,6 +124,7 @@ pub enum UpdateOneofLimitedEncodeAccount<'a> {
         account: UpdateOneofLimitedEncodeAccountInner<'a>,
         slot: Slot,
         is_startup: bool,
+        bank_id: Option<BankId>,
     },
 }
 
@@ -135,6 +136,7 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                 account,
                 slot,
                 is_startup,
+                bank_id,
             } => {
                 encode_key(1u32, WireType::LengthDelimited, buf);
                 encode_varint(account.encoded_len() as u64, buf);
@@ -144,6 +146,9 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                 }
                 if !is_startup {
                     encoding::bool::encode(3u32, is_startup, buf);
+                }
+                if let Some(bank_id) = bank_id {
+                    encoding::uint64::encode(4u32, bank_id, buf);
                 }
             }
         }
@@ -156,6 +161,7 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                 account,
                 slot,
                 is_startup,
+                bank_id,
             } => {
                 let account_len = account.encoded_len();
                 key_len(1u32)
@@ -171,6 +177,9 @@ impl Message for UpdateOneofLimitedEncodeAccount<'_> {
                     } else {
                         0
                     }
+                    + bank_id
+                        .as_ref()
+                        .map_or(0, |value| encoding::uint64::encoded_len(4u32, value))
             }
         }
     }
@@ -288,6 +297,7 @@ pub struct UpdateOneofLimitedEncodeTransactionStatus<'a> {
     pub is_vote: bool,
     pub index: u64,
     pub err: Option<confirmed_block::TransactionError>,
+    pub bank_id: BankId,
 }
 
 impl Message for UpdateOneofLimitedEncodeTransactionStatus<'_> {
@@ -306,6 +316,9 @@ impl Message for UpdateOneofLimitedEncodeTransactionStatus<'_> {
         }
         if let Some(msg) = &self.err {
             encoding::message::encode(5u32, msg, buf);
+        }
+        if self.bank_id != 0u64 {
+            encoding::uint64::encode(6u32, &self.bank_id, buf);
         }
     }
 
@@ -330,6 +343,11 @@ impl Message for UpdateOneofLimitedEncodeTransactionStatus<'_> {
             .err
             .as_ref()
             .map_or(0, |msg| encoding::message::encoded_len(5u32, msg))
+            + if self.bank_id != 0u64 {
+                encoding::uint64::encoded_len(6u32, &self.bank_id)
+            } else {
+                0
+            }
     }
 
     fn merge_field(
@@ -365,6 +383,7 @@ pub struct UpdateOneofLimitedEncodeBlock<'a> {
     pub accounts: Vec<UpdateOneofLimitedEncodeAccountInner<'a>>,
     pub entries_count: u64,
     pub entries: Vec<&'a [u8]>,
+    pub bank_id: BankId,
 }
 
 impl Message for UpdateOneofLimitedEncodeBlock<'_> {
@@ -411,6 +430,9 @@ impl Message for UpdateOneofLimitedEncodeBlock<'_> {
             encode_key(13u32, WireType::LengthDelimited, buf);
             encode_varint(slice.len() as u64, buf);
             buf.put_slice(slice);
+        }
+        if self.bank_id != 0u64 {
+            encoding::uint64::encode(14u32, &self.bank_id, buf);
         }
     }
 
@@ -475,6 +497,11 @@ impl Message for UpdateOneofLimitedEncodeBlock<'_> {
                     .map(|slice| slice.len())
                     .map(|len| len + encoded_len_varint(len as u64))
                     .sum::<usize>())
+            + if self.bank_id != 0u64 {
+                encoding::uint64::encoded_len(14u32, &self.bank_id)
+            } else {
+                0
+            }
     }
 
     fn merge_field(

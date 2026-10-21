@@ -5,8 +5,9 @@ use {
     richat_filter::{config::ConfigFilter, filter::Filter},
     richat_proto::geyser::{
         SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
-        SubscribeRequestFilterSlots, SubscribeUpdate, SubscribeUpdateAccount,
-        SubscribeUpdateAccountInfo, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+        SubscribeRequestFilterEntry, SubscribeRequestFilterSlots, SubscribeUpdate,
+        SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlockFooter,
+        SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateEntryUpdateParent,
         SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
         subscribe_update::UpdateOneof,
     },
@@ -46,7 +47,13 @@ fn request(level: CommitmentLevel) -> SubscribeRequest {
         transactions: HashMap::from([("transactions".into(), Default::default())]),
         transactions_status: HashMap::from([("status".into(), Default::default())]),
         blocks_meta: HashMap::from([("meta".into(), Default::default())]),
-        entry: HashMap::from([("entries".into(), Default::default())]),
+        entry: HashMap::from([(
+            "entries".into(),
+            SubscribeRequestFilterEntry {
+                include_update_parent: Some(true),
+            },
+        )]),
+        block_footer: HashMap::from([("footer".into(), Default::default())]),
         ..Default::default()
     }
 }
@@ -74,17 +81,27 @@ fn message(update: UpdateOneof, parser: MessageParserEncoding) -> Message {
 }
 
 fn status(slot: Slot, status: SlotStatus) -> UpdateOneof {
+    status_bank(slot, status, None)
+}
+
+fn status_bank(slot: Slot, status: SlotStatus, bank_id: Option<BankId>) -> UpdateOneof {
     UpdateOneof::Slot(SubscribeUpdateSlot {
         slot,
         parent: Some(slot.saturating_sub(1)),
         status: status as i32,
         dead_error: None,
+        bank_id,
     })
 }
 
 fn account(slot: Slot, version: u64) -> UpdateOneof {
+    account_bank(slot, version, None)
+}
+
+fn account_bank(slot: Slot, version: u64, bank_id: Option<BankId>) -> UpdateOneof {
     UpdateOneof::Account(SubscribeUpdateAccount {
         slot,
+        bank_id,
         is_startup: false,
         account: Some(SubscribeUpdateAccountInfo {
             pubkey: vec![1; 32],
@@ -98,11 +115,16 @@ fn account(slot: Slot, version: u64) -> UpdateOneof {
 }
 
 fn transaction(slot: Slot) -> UpdateOneof {
+    transaction_bank(slot, 0)
+}
+
+fn transaction_bank(slot: Slot, bank_id: BankId) -> UpdateOneof {
     use richat_proto::solana::storage::confirmed_block::{
         Message as TransactionMessage, MessageHeader, Transaction, TransactionStatusMeta,
     };
     UpdateOneof::Transaction(SubscribeUpdateTransaction {
         slot,
+        bank_id,
         transaction: Some(SubscribeUpdateTransactionInfo {
             signature: vec![5; 64],
             transaction: Some(Transaction {
@@ -172,8 +194,94 @@ fn update_slot(update: &SubscribeUpdate) -> Slot {
         UpdateOneof::Block(msg) => msg.slot,
         UpdateOneof::Transaction(msg) => msg.slot,
         UpdateOneof::TransactionStatus(msg) => msg.slot,
+        UpdateOneof::BlockFooter(msg) => msg.slot,
+        UpdateOneof::EntryUpdateParent(msg) => msg.slot,
         _ => panic!("unexpected test update"),
     }
+}
+
+/// Data of one Alpenglow candidate bank of the slot
+fn candidate(slot: Slot, bank_id: BankId) -> Vec<UpdateOneof> {
+    vec![
+        status_bank(slot, SlotStatus::SlotCreatedBank, Some(bank_id)),
+        account_bank(slot, bank_id * 10, Some(bank_id)),
+        transaction_bank(slot, bank_id),
+        UpdateOneof::Entry(SubscribeUpdateEntry {
+            slot,
+            hash: vec![4; 32],
+            executed_transaction_count: 1,
+            bank_id,
+            ..Default::default()
+        }),
+        UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+            slot,
+            blockhash: format!("blockhash-{bank_id}"),
+            parent_slot: slot - 1,
+            block_height: Some(
+                richat_proto::solana::storage::confirmed_block::BlockHeight { block_height: slot },
+            ),
+            entries_count: 1,
+            executed_transaction_count: 1,
+            bank_id,
+            ..Default::default()
+        }),
+        UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+            slot,
+            bank_id,
+            bank_hash: vec![bank_id as u8; 32],
+            block_producer_time_nanos: 1,
+            ..Default::default()
+        }),
+    ]
+}
+
+fn update_parent(slot: Slot, cleared_bank_id: BankId) -> UpdateOneof {
+    UpdateOneof::EntryUpdateParent(SubscribeUpdateEntryUpdateParent {
+        slot,
+        cleared_bank_id,
+        parent_slot: slot - 2,
+        parent_block_id: vec![9; 32],
+    })
+}
+
+/// `(type, bank_id)` of every non-slot update
+fn update_banks(updates: &[SubscribeUpdate]) -> Vec<(&'static str, BankId)> {
+    updates
+        .iter()
+        .filter_map(|update| match update.update_oneof.as_ref().unwrap() {
+            UpdateOneof::Slot(_) => None,
+            UpdateOneof::Account(msg) => Some(("account", msg.bank_id.unwrap_or_default())),
+            UpdateOneof::Transaction(msg) => Some(("transaction", msg.bank_id)),
+            UpdateOneof::TransactionStatus(msg) => Some(("transactionStatus", msg.bank_id)),
+            UpdateOneof::Entry(msg) => Some(("entry", msg.bank_id)),
+            UpdateOneof::BlockMeta(msg) => Some(("blockMeta", msg.bank_id)),
+            UpdateOneof::Block(msg) => Some(("block", msg.bank_id)),
+            UpdateOneof::BlockFooter(msg) => Some(("blockFooter", msg.bank_id)),
+            UpdateOneof::EntryUpdateParent(msg) => Some(("entryUpdateParent", msg.cleared_bank_id)),
+            _ => panic!("unexpected test update"),
+        })
+        .collect()
+}
+
+fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+    items.sort();
+    items
+}
+
+/// Every update of a complete candidate, see `candidate`
+fn candidate_updates(bank_id: BankId) -> Vec<(&'static str, BankId)> {
+    [
+        "account",
+        "block",
+        "blockFooter",
+        "blockMeta",
+        "entry",
+        "transaction",
+        "transactionStatus",
+    ]
+    .into_iter()
+    .map(|kind| (kind, bank_id))
+    .collect()
 }
 
 struct Harness {
@@ -255,10 +363,14 @@ impl Harness {
     }
 
     fn push(&mut self, update: UpdateOneof) {
+        self.push_from(false, "test", update);
+    }
+
+    fn push_from(&mut self, dedup_required: bool, source: &'static str, update: UpdateOneof) {
         self.sender
             .as_mut()
             .unwrap()
-            .push(false, "test", message(update, self.parser));
+            .push(dedup_required, source, message(update, self.parser));
         let receiver = self.messages().to_receiver();
         for (idx, level) in LEVELS.into_iter().enumerate() {
             while let Some(msg) = receiver.try_recv(level, self.heads[idx]).unwrap() {
@@ -1355,4 +1467,285 @@ fn upstream_gap_invalidates_replay_and_persists_the_new_capture_boundary() {
         Some(1010)
     );
     assert_eq!(harness.messages().get_first_available_slot(), Some(1000));
+}
+
+#[test]
+fn alpenglow_only_the_confirmed_candidate_reaches_confirmed_and_finalized() {
+    for parser in [MessageParserEncoding::Prost, MessageParserEncoding::Limited] {
+        let mut harness = Harness::with_storage(parser, None, 256);
+        for event in candidate(10, 1).into_iter().chain(candidate(10, 2)) {
+            harness.push(event);
+        }
+        harness.push(status(10, SlotStatus::SlotProcessed));
+        // the lower bank wins, so the selection does not fall back to the latest candidate
+        harness.push(status_bank(10, SlotStatus::SlotConfirmed, Some(1)));
+        // late data of the losing candidate
+        harness.push(account_bank(10, 100, Some(2)));
+        // finalized status without bank follows the confirmed candidate
+        harness.push(status(10, SlotStatus::SlotFinalized));
+
+        let mut processed = candidate_updates(1);
+        processed.extend(candidate_updates(2));
+        processed.push(("account", 2));
+        assert_eq!(
+            sorted(update_banks(&harness.expected[0])),
+            sorted(processed),
+            "{parser:?}: processed streams every candidate with its bank_id"
+        );
+        for idx in [1, 2] {
+            assert_eq!(
+                sorted(update_banks(&harness.expected[idx])),
+                candidate_updates(1),
+                "{parser:?}, {:?}: only the confirmed candidate",
+                LEVELS[idx]
+            );
+        }
+    }
+}
+
+#[test]
+fn alpenglow_cleared_bank_is_dropped_and_never_confirmed() {
+    for parser in [MessageParserEncoding::Prost, MessageParserEncoding::Limited] {
+        let mut harness = Harness::with_storage(parser, None, 256);
+        harness.push(status_bank(10, SlotStatus::SlotCreatedBank, Some(1)));
+        harness.push(account_bank(10, 1, Some(1)));
+        harness.push(update_parent(10, 1));
+        // data of the cleared bank received after `EntryUpdateParent` is invalid
+        harness.push(account_bank(10, 2, Some(1)));
+        harness.push(status_bank(10, SlotStatus::SlotCompleted, Some(1)));
+        for event in candidate(10, 2) {
+            harness.push(event);
+        }
+        harness.push(status(10, SlotStatus::SlotProcessed));
+        // statuses without bank select the remaining candidate
+        harness.push(status(10, SlotStatus::SlotConfirmed));
+        harness.push(status(10, SlotStatus::SlotFinalized));
+
+        let mut processed = candidate_updates(2);
+        processed.push(("account", 1));
+        processed.push(("entryUpdateParent", 1));
+        assert_eq!(
+            sorted(update_banks(&harness.expected[0])),
+            sorted(processed),
+            "{parser:?}"
+        );
+        assert!(
+            !harness.expected[0].iter().any(|update| matches!(
+                &update.update_oneof,
+                Some(UpdateOneof::Slot(slot)) if slot.bank_id == Some(1) && slot.status == SlotStatus::SlotCompleted as i32
+            )),
+            "{parser:?}: statuses of the cleared bank are dropped"
+        );
+        for idx in [1, 2] {
+            assert_eq!(
+                sorted(update_banks(&harness.expected[idx])),
+                candidate_updates(2),
+                "{parser:?}, {:?}",
+                LEVELS[idx]
+            );
+        }
+    }
+}
+
+#[test]
+fn alpenglow_bank_scoped_messages_are_taken_from_one_source() {
+    let mut harness = Harness::with_storage(MessageParserEncoding::Prost, None, 256);
+    for event in candidate(10, 1) {
+        harness.push_from(true, "a", event);
+    }
+    // `bank_id` is local to the node, banks of another source can not be merged
+    for event in candidate(10, 7) {
+        harness.push_from(true, "b", event);
+    }
+    // messages without bank still race between sources
+    harness.push_from(true, "b", status(10, SlotStatus::SlotProcessed));
+    harness.push_from(true, "b", status(10, SlotStatus::SlotConfirmed));
+    harness.push_from(true, "a", status(10, SlotStatus::SlotConfirmed));
+    harness.push_from(true, "b", status(10, SlotStatus::SlotFinalized));
+
+    for (idx, level) in LEVELS.into_iter().enumerate() {
+        assert_eq!(
+            sorted(update_banks(&harness.expected[idx])),
+            candidate_updates(1),
+            "{level:?}"
+        );
+        let statuses = harness.expected[idx]
+            .iter()
+            .filter(|update| matches!(&update.update_oneof, Some(UpdateOneof::Slot(slot)) if slot.status == idx as i32))
+            .count();
+        assert_eq!(statuses, 1, "{level:?}: deduplicated status");
+    }
+}
+
+#[test]
+fn alpenglow_disk_replay_matches_live_with_candidates() {
+    for parser in [MessageParserEncoding::Prost, MessageParserEncoding::Limited] {
+        let dir = TempDir::new();
+        let mut harness = Harness::open(&dir.0, parser, 3000, true);
+        for event in candidate(10, 1)
+            .into_iter()
+            .chain([update_parent(10, 1)])
+            .chain(candidate(10, 2))
+            .chain(candidate(10, 3))
+        {
+            harness.push(event);
+        }
+        harness.push(status(10, SlotStatus::SlotProcessed));
+        harness.push(status_bank(10, SlotStatus::SlotConfirmed, Some(2)));
+        harness.push(status(10, SlotStatus::SlotFinalized));
+        for slot in 11..14 {
+            for event in block(slot) {
+                harness.push(event);
+            }
+        }
+        harness.flush();
+        for (idx, level) in LEVELS.into_iter().enumerate() {
+            let client = harness.client(10, level);
+            assert_eq!(
+                harness.finish_replay(&client),
+                harness.expected[idx],
+                "{parser:?}, {level:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yellowstone_client_receives_requested_compression_by_default() {
+    use {
+        crate::grpc::server::GrpcServer,
+        hyper_util::rt::TokioIo,
+        richat_proto::geyser::{
+            GetVersionRequest, SubscribeRequestPing, geyser_client::GeyserClient,
+        },
+        richat_shared::transports::grpc::ConfigGrpcServer,
+        std::{
+            future::{Ready, ready},
+            task::{Context, Poll},
+        },
+        tonic::{codec::CompressionEncoding, codegen::Service, transport::Endpoint},
+    };
+    struct Connector(Option<tokio::io::DuplexStream>);
+    impl Service<hyper::Uri> for Connector {
+        type Response = TokioIo<tokio::io::DuplexStream>;
+        type Error = std::io::Error;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, _: hyper::Uri) -> Self::Future {
+            ready(
+                self.0
+                    .take()
+                    .map(TokioIo::new)
+                    .ok_or_else(|| std::io::Error::other("test transport already connected")),
+            )
+        }
+    }
+
+    // clients without compression still receive uncompressed data
+    for (encoding, name) in [
+        (Some(CompressionEncoding::Gzip), Some("gzip")),
+        (Some(CompressionEncoding::Zstd), Some("zstd")),
+        (None, None),
+    ] {
+        let mut harness = Harness::with_storage(MessageParserEncoding::Prost, None, 256);
+        let shutdown = CancellationToken::new();
+        let (service, worker) =
+            GrpcServer::test_service(harness.messages().clone(), shutdown.clone());
+        // the same service setup as `GrpcServer::spawn` with the default config
+        let service = service.create_service(&ConfigGrpcServer::default());
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let cancellation = shutdown.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(
+                    futures::stream::iter([Ok::<_, std::io::Error>(server_io)])
+                        .chain(futures::stream::pending()),
+                    cancellation.cancelled(),
+                )
+                .await
+                .unwrap();
+        });
+        let channel = tokio::time::timeout(
+            Duration::from_secs(5),
+            Endpoint::from_static("http://richat.test")
+                .connect_with_connector(Connector(Some(client_io))),
+        )
+        .await
+        .expect("connect timeout")
+        .unwrap();
+        let mut client = GeyserClient::new(channel);
+        if let Some(encoding) = encoding {
+            client = client.send_compressed(encoding).accept_compressed(encoding);
+        }
+
+        let response = client.get_version(GetVersionRequest {}).await.unwrap();
+        assert_eq!(
+            response
+                .metadata()
+                .get("grpc-encoding")
+                .map(|value| value.to_str().unwrap()),
+            name,
+            "unary response is compressed with {encoding:?}"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let requests = futures::stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|request| (request, rx))
+        });
+        tx.send(request(CommitmentLevel::Processed)).unwrap();
+        tx.send(SubscribeRequest {
+            ping: Some(SubscribeRequestPing { id: 7 }),
+            ..request(CommitmentLevel::Processed)
+        })
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), client.subscribe(requests))
+            .await
+            .expect("subscribe timeout")
+            .unwrap();
+        assert_eq!(
+            response
+                .metadata()
+                .get("grpc-encoding")
+                .map(|value| value.to_str().unwrap()),
+            name,
+            "subscribe stream is compressed with {encoding:?}"
+        );
+        let mut stream = response.into_inner();
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(UpdateOneof::Pong(pong)) = update.update_oneof {
+                assert_eq!(pong.id, 7);
+                break;
+            }
+        }
+        for event in block(10) {
+            harness.push(event);
+        }
+        loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Some(UpdateOneof::Block(block)) = update.update_oneof {
+                assert_eq!(block.slot, 10);
+                break;
+            }
+        }
+
+        drop(stream);
+        drop(tx);
+        shutdown.cancel();
+        server.await.unwrap();
+        tokio::task::spawn_blocking(move || worker.join().unwrap().unwrap())
+            .await
+            .unwrap();
+    }
 }

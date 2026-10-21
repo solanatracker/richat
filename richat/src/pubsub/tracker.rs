@@ -830,6 +830,7 @@ impl SlotTransactionStatsItem {
                 parent: None,
                 status: SlotStatus::SlotProcessed,
                 dead_error: None,
+                bank_id: None,
                 created_at: self.created_at,
                 size: 0,
             };

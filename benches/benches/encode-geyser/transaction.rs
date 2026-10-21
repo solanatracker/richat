@@ -26,6 +26,7 @@ pub fn bench_encode_transactions(criterion: &mut Criterion) {
                         for (slot, transaction) in transactions {
                             let message = ProtobufMessage::Transaction {
                                 slot: *slot,
+                                bank_id: 42,
                                 transaction,
                             };
                             message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
@@ -45,6 +46,7 @@ pub fn bench_encode_transactions(criterion: &mut Criterion) {
                         for (slot, transaction) in transactions {
                             let message = ProtobufMessage::Transaction {
                                 slot: *slot,
+                                bank_id: 42,
                                 transaction,
                             };
                             message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);

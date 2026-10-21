@@ -6,6 +6,7 @@ use {
         encoding::{self, DecodeContext, WireType},
     },
     richat_proto::geyser::CommitmentLevel,
+    solana_clock::BankId,
 };
 
 const fn slot_status_as_i32(status: &SlotStatus) -> i32 {
@@ -33,6 +34,7 @@ pub struct Slot<'a> {
     slot: solana_clock::Slot,
     parent: Option<u64>,
     status: &'a SlotStatus,
+    bank_id: Option<BankId>,
 }
 
 impl<'a> Slot<'a> {
@@ -40,11 +42,13 @@ impl<'a> Slot<'a> {
         slot: solana_clock::Slot,
         parent: Option<u64>,
         status: &'a SlotStatus,
+        bank_id: Option<BankId>,
     ) -> Self {
         Self {
             slot,
             parent,
             status,
+            bank_id,
         }
     }
 }
@@ -65,6 +69,9 @@ impl Message for Slot<'_> {
         }
         if let Some(value) = dead_error {
             encoding::string::encode(4u32, value, buf);
+        }
+        if let Some(value) = &self.bank_id {
+            encoding::uint64::encode(5u32, value, buf);
         }
     }
 
@@ -88,6 +95,10 @@ impl Message for Slot<'_> {
             + dead_error
                 .as_ref()
                 .map_or(0, |value| encoding::string::encoded_len(4u32, value))
+            + self
+                .bank_id
+                .as_ref()
+                .map_or(0, |value| encoding::uint64::encoded_len(5u32, value))
     }
 
     fn merge_field(

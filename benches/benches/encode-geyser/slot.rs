@@ -22,6 +22,7 @@ pub fn bench_encode_slot(criterion: &mut Criterion) {
                             slot: *slot,
                             parent: *parent,
                             status,
+                            bank_id: Some(42),
                         };
                         message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
                     }
@@ -38,6 +39,7 @@ pub fn bench_encode_slot(criterion: &mut Criterion) {
                             slot: *slot,
                             parent: *parent,
                             status,
+                            bank_id: Some(42),
                         };
                         message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
                     }

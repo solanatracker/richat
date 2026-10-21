@@ -18,6 +18,7 @@ pub fn bench_parse_slots(criterion: &mut Criterion) {
                 slot,
                 parent,
                 status,
+                bank_id: s.bank_id,
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
         })

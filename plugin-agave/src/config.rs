@@ -77,12 +77,12 @@ impl Default for ConfigChannel {
     }
 }
 
-/// Optional Geyser notifications, all disabled by default.
+/// Optional Geyser notifications, all enabled by default like in Yellowstone gRPC.
 ///
 /// Accounts, transactions, entries, slots and block metadata are always enabled.
-/// Messages produced by these notifications are Richat-only (see `SubscribeUpdateRichat`)
-/// and are only sent to clients that explicitly enable them in `RichatFilter`.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+/// Messages produced by these notifications are sent on the Richat stream as
+/// `SubscribeUpdateRichat` and only to clients that explicitly enable them in `RichatFilter`.
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigNotifications {
     /// Transactions reconstructed from shreds before replay (agave 4.1+),
@@ -94,6 +94,17 @@ pub struct ConfigNotifications {
     pub contact_info: bool,
     /// Alpenglow block footers (agave 4.3+)
     pub block_footers: bool,
+}
+
+impl Default for ConfigNotifications {
+    fn default() -> Self {
+        Self {
+            deshred_transactions: true,
+            deshred_transactions_alt_resolution: true,
+            contact_info: true,
+            block_footers: true,
+        }
+    }
 }
 
 impl ConfigChannel {

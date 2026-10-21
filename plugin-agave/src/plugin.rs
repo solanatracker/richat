@@ -173,6 +173,25 @@ pub struct Plugin {
 }
 
 impl Plugin {
+    fn push_slot_status(
+        &self,
+        slot: Slot,
+        parent: Option<u64>,
+        status: &SlotStatus,
+        bank_id: Option<BankId>,
+    ) {
+        let inner = self.inner.as_ref().expect("initialized");
+        inner.messages.push(
+            ProtobufMessage::Slot {
+                slot,
+                parent,
+                status,
+                bank_id,
+            },
+            inner.encoder,
+        );
+    }
+
     fn notifications(&self) -> ConfigNotifications {
         self.inner
             .as_ref()
@@ -235,7 +254,7 @@ impl GeyserPlugin for Plugin {
         &self,
         account: ReplicaAccountInfoVersions,
         slot: Slot,
-        _bank_id: BankId,
+        bank_id: BankId,
     ) -> PluginResult<()> {
         let account = match account {
             ReplicaAccountInfoVersions::V0_0_1(_info) => {
@@ -248,9 +267,14 @@ impl GeyserPlugin for Plugin {
         };
 
         let inner = self.inner.as_ref().expect("initialized");
-        inner
-            .messages
-            .push(ProtobufMessage::Account { slot, account }, inner.encoder);
+        inner.messages.push(
+            ProtobufMessage::Account {
+                slot,
+                bank_id: Some(bank_id),
+                account,
+            },
+            inner.encoder,
+        );
 
         Ok(())
     }
@@ -267,16 +291,7 @@ impl GeyserPlugin for Plugin {
         parent: Option<u64>,
         status: &SlotStatus,
     ) -> PluginResult<()> {
-        let inner = self.inner.as_ref().expect("initialized");
-        inner.messages.push(
-            ProtobufMessage::Slot {
-                slot,
-                parent,
-                status,
-            },
-            inner.encoder,
-        );
-
+        self.push_slot_status(slot, parent, status, None);
         Ok(())
     }
 
@@ -287,16 +302,17 @@ impl GeyserPlugin for Plugin {
         slot: Slot,
         parent: Option<u64>,
         status: &SlotStatus,
-        _bank_id: BankId,
+        bank_id: BankId,
     ) -> PluginResult<()> {
-        self.update_slot_status(slot, parent, status)
+        self.push_slot_status(slot, parent, status, Some(bank_id));
+        Ok(())
     }
 
     fn notify_transaction_for_bank(
         &self,
         transaction: ReplicaTransactionInfoVersions<'_>,
         slot: Slot,
-        _bank_id: BankId,
+        bank_id: BankId,
     ) -> PluginResult<()> {
         let transaction = match transaction {
             ReplicaTransactionInfoVersions::V0_0_1(_info) => {
@@ -310,7 +326,11 @@ impl GeyserPlugin for Plugin {
 
         let inner = self.inner.as_ref().expect("initialized");
         inner.messages.push(
-            ProtobufMessage::Transaction { slot, transaction },
+            ProtobufMessage::Transaction {
+                slot,
+                bank_id,
+                transaction,
+            },
             inner.encoder,
         );
 
@@ -320,7 +340,7 @@ impl GeyserPlugin for Plugin {
     fn notify_entry_for_bank(
         &self,
         entry: ReplicaEntryInfoVersions,
-        _bank_id: BankId,
+        bank_id: BankId,
     ) -> PluginResult<()> {
         #[allow(clippy::infallible_destructuring_match)]
         let entry = match entry {
@@ -333,7 +353,7 @@ impl GeyserPlugin for Plugin {
         let inner = self.inner.as_ref().expect("initialized");
         inner
             .messages
-            .push(ProtobufMessage::Entry { entry }, inner.encoder);
+            .push(ProtobufMessage::Entry { bank_id, entry }, inner.encoder);
 
         Ok(())
     }
@@ -341,7 +361,7 @@ impl GeyserPlugin for Plugin {
     fn notify_block_metadata_for_bank(
         &self,
         blockinfo: ReplicaBlockInfoVersions<'_>,
-        _bank_id: BankId,
+        bank_id: BankId,
     ) -> PluginResult<()> {
         let blockinfo = match blockinfo {
             ReplicaBlockInfoVersions::V0_0_1(_info) => {
@@ -357,9 +377,10 @@ impl GeyserPlugin for Plugin {
         };
 
         let inner = self.inner.as_ref().expect("initialized");
-        inner
-            .messages
-            .push(ProtobufMessage::BlockMeta { blockinfo }, inner.encoder);
+        inner.messages.push(
+            ProtobufMessage::BlockMeta { bank_id, blockinfo },
+            inner.encoder,
+        );
 
         Ok(())
     }

@@ -2,13 +2,14 @@ use {
     crate::{
         config::{
             ConfigFilter, ConfigFilterAccounts, ConfigFilterAccountsDataSlice,
-            ConfigFilterAccountsFilter, ConfigFilterAccountsFilterLamports, ConfigFilterBlocks,
-            ConfigFilterCommitment, ConfigFilterSlots, ConfigFilterTransactions, MAX_DATA_SIZE,
-            MAX_FILTERS,
+            ConfigFilterAccountsFilter, ConfigFilterAccountsFilterLamports,
+            ConfigFilterBlockFooter, ConfigFilterBlocks, ConfigFilterCommitment, ConfigFilterSlots,
+            ConfigFilterTransactions, MAX_DATA_SIZE, MAX_FILTERS,
         },
         message::{
-            Message, MessageAccount, MessageBlock, MessageBlockCreatedAt, MessageBlockMeta,
-            MessageEntry, MessageRef, MessageSlot, MessageTransaction,
+            Message, MessageAccount, MessageBlock, MessageBlockCreatedAt, MessageBlockFooter,
+            MessageBlockMeta, MessageEntry, MessageEntryUpdateParent, MessageRef, MessageSlot,
+            MessageTransaction,
         },
         protobuf::encode::{
             SubscribeUpdateMessageLimited, SubscribeUpdateMessageProst, UpdateOneofLimitedEncode,
@@ -17,11 +18,11 @@ use {
         },
     },
     arrayvec::ArrayVec,
-    prost::{Message as _, bytes::BufMut, encoding::decode_varint},
+    prost::encoding::decode_varint,
     richat_proto::geyser::{
         SlotStatus, SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-        SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionStatus,
-        subscribe_update::UpdateOneof,
+        SubscribeUpdateBlockFooter, SubscribeUpdateSlot, SubscribeUpdateTransaction,
+        SubscribeUpdateTransactionStatus, subscribe_update::UpdateOneof,
     },
     smallvec::{SmallVec, smallvec},
     solana_account::ReadableAccount,
@@ -84,6 +85,7 @@ pub struct Filter {
     entries: FilterEntries,
     blocks_meta: FilterBlocksMeta,
     blocks: FilterBlocks,
+    block_footer: FilterBlockFooter,
     commitment: ConfigFilterCommitment,
 }
 
@@ -104,6 +106,7 @@ impl Default for Filter {
             entries: FilterEntries::default(),
             blocks_meta: FilterBlocksMeta::default(),
             blocks: FilterBlocks::default(),
+            block_footer: FilterBlockFooter::default(),
             commitment: ConfigFilterCommitment::default(),
         }
     }
@@ -126,9 +129,10 @@ impl Filter {
                 &config.transactions_status,
                 FilterTransactionsType::TransactionStatus,
             ),
-            entries: FilterEntries::new(&mut names, &config.entries),
+            entries: FilterEntries::new(&mut names, &config.entries, &config.entries_update_parent),
             blocks_meta: FilterBlocksMeta::new(&mut names, &config.blocks_meta),
             blocks: FilterBlocks::new(&mut names, &config.blocks),
+            block_footer: FilterBlockFooter::new(&mut names, &config.block_footer),
             commitment: config
                 .commitment
                 .unwrap_or(ConfigFilterCommitment::Processed),
@@ -191,6 +195,16 @@ impl Filter {
             }
             MessageRef::Block(message) => {
                 for update in self.blocks.get_updates(message, &self.accounts_data_slices) {
+                    vec.push(update);
+                }
+            }
+            MessageRef::BlockFooter(message) => {
+                for update in self.block_footer.get_updates(message) {
+                    vec.push(update);
+                }
+            }
+            MessageRef::EntryUpdateParent(message) => {
+                if let Some(update) = self.entries.get_update_parent(message) {
                     vec.push(update);
                 }
             }
@@ -601,13 +615,39 @@ impl FilterTransactions {
 #[derive(Debug, Default, Clone)]
 struct FilterEntries {
     filters: Vec<FilterName>,
+    filters_update_parent: Vec<FilterName>,
 }
 
 impl FilterEntries {
-    fn new(names: &mut FilterNames, configs: &HashSet<String>) -> Self {
+    fn new(
+        names: &mut FilterNames,
+        configs: &HashSet<String>,
+        configs_update_parent: &HashSet<String>,
+    ) -> Self {
         Self {
             filters: configs.iter().map(|name| names.get(name)).collect(),
+            filters_update_parent: configs
+                .iter()
+                .filter(|name| configs_update_parent.contains(*name))
+                .map(|name| names.get(name))
+                .collect(),
         }
+    }
+
+    fn get_update_parent<'a>(
+        &'a self,
+        message: &'a MessageEntryUpdateParent,
+    ) -> Option<FilteredUpdate<'a>> {
+        let filters = self
+            .filters_update_parent
+            .iter()
+            .map(|f| f.as_ref())
+            .collect::<FilteredUpdateFilters>();
+
+        filters.is_empty().not().then(|| FilteredUpdate {
+            filters,
+            filtered_update: FilteredUpdateType::EntryUpdateParent { message },
+        })
     }
 
     fn get_update<'a>(&'a self, message: &'a MessageEntry) -> Option<FilteredUpdate<'a>> {
@@ -742,6 +782,47 @@ impl FilterBlocks {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct FilterBlockFooter {
+    filters: HashMap<FilterName, bool>,
+}
+
+impl FilterBlockFooter {
+    fn new(names: &mut FilterNames, configs: &HashMap<String, ConfigFilterBlockFooter>) -> Self {
+        Self {
+            filters: configs
+                .iter()
+                .map(|(name, filter)| (names.get(name), filter.include_certificates == Some(true)))
+                .collect(),
+        }
+    }
+
+    fn get_updates<'a>(
+        &'a self,
+        message: &'a MessageBlockFooter,
+    ) -> impl Iterator<Item = FilteredUpdate<'a>> {
+        // group filters by `include_certificates`, at most two updates
+        [false, true]
+            .into_iter()
+            .filter_map(move |include_certificates| {
+                let filters = self
+                    .filters
+                    .iter()
+                    .filter(|(_name, value)| **value == include_certificates)
+                    .map(|(name, _value)| name.as_ref())
+                    .collect::<FilteredUpdateFilters>();
+
+                filters.is_empty().not().then(|| FilteredUpdate {
+                    filters,
+                    filtered_update: FilteredUpdateType::BlockFooter {
+                        message,
+                        include_certificates,
+                    },
+                })
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FilteredUpdate<'a> {
     pub filters: FilteredUpdateFilters<'a>,
@@ -755,7 +836,8 @@ impl FilteredUpdate<'_> {
         bytes
     }
 
-    pub fn encode(&self, buf: &mut impl BufMut) {
+    /// Reserves the exact message size before encoding
+    pub fn encode(&self, buf: &mut Vec<u8>) {
         match &self.filtered_update {
             FilteredUpdateType::Slot { message } => match message {
                 MessageSlot::Limited {
@@ -770,12 +852,13 @@ impl FilteredUpdate<'_> {
                     ),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageSlot::Prost {
                     slot,
                     parent,
                     status,
                     dead_error,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -785,10 +868,11 @@ impl FilteredUpdate<'_> {
                         parent: *parent,
                         status: *status as i32,
                         dead_error: dead_error.clone(),
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::Account {
                 message,
@@ -805,6 +889,7 @@ impl FilteredUpdate<'_> {
                     write_version,
                     slot,
                     is_startup,
+                    bank_id,
                     created_at,
                     buffer,
                     account_offset: _,
@@ -834,15 +919,17 @@ impl FilteredUpdate<'_> {
                             },
                             slot: *slot,
                             is_startup: *is_startup,
+                            bank_id: *bank_id,
                         }
                     }),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageAccount::Prost {
                     account,
                     slot,
                     is_startup,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -860,10 +947,11 @@ impl FilteredUpdate<'_> {
                         }),
                         slot: *slot,
                         is_startup: *is_startup,
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::Transaction { message } => match message {
                 MessageTransaction::Limited {
@@ -878,10 +966,11 @@ impl FilteredUpdate<'_> {
                     ),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageTransaction::Prost {
                     transaction,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -889,10 +978,11 @@ impl FilteredUpdate<'_> {
                     update: UpdateOneof::Transaction(SubscribeUpdateTransaction {
                         transaction: Some(transaction.clone()),
                         slot: *slot,
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::TransactionStatus { message } => match message {
                 MessageTransaction::Limited {
@@ -900,6 +990,7 @@ impl FilteredUpdate<'_> {
                     is_vote,
                     index,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageLimited {
@@ -911,15 +1002,17 @@ impl FilteredUpdate<'_> {
                             is_vote: *is_vote,
                             index: *index,
                             err: error.clone(),
+                            bank_id: *bank_id,
                         },
                     ),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageTransaction::Prost {
                     error,
                     transaction,
                     slot,
+                    bank_id,
                     created_at,
                     ..
                 } => SubscribeUpdateMessageProst {
@@ -930,10 +1023,11 @@ impl FilteredUpdate<'_> {
                         is_vote: transaction.is_vote,
                         index: transaction.index,
                         err: error.clone(),
+                        bank_id: *bank_id,
                     }),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::Entry { message } => match message {
                 MessageEntry::Limited {
@@ -948,7 +1042,7 @@ impl FilteredUpdate<'_> {
                     ),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageEntry::Prost {
                     entry, created_at, ..
                 } => SubscribeUpdateMessageProst {
@@ -956,7 +1050,7 @@ impl FilteredUpdate<'_> {
                     update: UpdateOneof::Entry(entry.clone()),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::BlockMeta { message } => match message {
                 MessageBlockMeta::Limited {
@@ -971,7 +1065,7 @@ impl FilteredUpdate<'_> {
                     ),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
                 MessageBlockMeta::Prost {
                     block_meta,
                     created_at,
@@ -981,7 +1075,7 @@ impl FilteredUpdate<'_> {
                     update: UpdateOneof::BlockMeta(block_meta.clone()),
                     created_at: *created_at,
                 }
-                .encode(buf),
+                .encode_reserved(buf),
             },
             FilteredUpdateType::Block {
                 message,
@@ -1067,10 +1161,11 @@ impl FilteredUpdate<'_> {
                             } else {
                                 vec![]
                             },
+                            bank_id: block_meta.bank_id,
                         }),
                         created_at,
                     }
-                    .encode(buf)
+                    .encode_reserved(buf)
                 }
                 MessageBlockCreatedAt::Prost(created_at) => {
                     let block_meta = match message.block_meta.as_ref() {
@@ -1130,16 +1225,50 @@ impl FilteredUpdate<'_> {
                             } else {
                                 vec![]
                             },
+                            bank_id: block_meta.bank_id,
                         }),
                         created_at,
                     }
-                    .encode(buf)
+                    .encode_reserved(buf)
                 }
             },
+            FilteredUpdateType::BlockFooter {
+                message,
+                include_certificates,
+            } => SubscribeUpdateMessageProst {
+                filters: &self.filters,
+                update: UpdateOneof::BlockFooter(if *include_certificates {
+                    message.footer().clone()
+                } else {
+                    SubscribeUpdateBlockFooter {
+                        block_final_cert: None,
+                        skip_reward_cert: None,
+                        notar_reward_cert: None,
+                        ..message.footer().clone()
+                    }
+                }),
+                created_at: message.created_at().into(),
+            }
+            .encode_reserved(buf),
+            FilteredUpdateType::EntryUpdateParent { message } => SubscribeUpdateMessageProst {
+                filters: &self.filters,
+                update: UpdateOneof::EntryUpdateParent(message.update().clone()),
+                created_at: message.created_at().into(),
+            }
+            .encode_reserved(buf),
         }
-        .expect("valid encode");
     }
 }
+
+trait EncodeReserved: prost::Message + Sized {
+    /// `Message::encode` does not reserve, so large messages would grow the `Vec` many times
+    fn encode_reserved(&self, buf: &mut Vec<u8>) {
+        buf.reserve(self.encoded_len());
+        self.encode_raw(buf);
+    }
+}
+
+impl<T: prost::Message> EncodeReserved for T {}
 
 pub type FilteredUpdateFilters<'a> = SmallVec<[&'a str; 8]>;
 
@@ -1171,6 +1300,13 @@ pub enum FilteredUpdateType<'a> {
         entries: bool,
         data_slices: &'a FilterAccountDataSlices,
     },
+    BlockFooter {
+        message: &'a MessageBlockFooter,
+        include_certificates: bool,
+    },
+    EntryUpdateParent {
+        message: &'a MessageEntryUpdateParent,
+    },
 }
 
 impl<'a> From<MessageRef<'a>> for FilteredUpdateType<'a> {
@@ -1191,6 +1327,11 @@ impl<'a> From<MessageRef<'a>> for FilteredUpdateType<'a> {
                 entries: true,
                 data_slices: FilterAccountDataSlices::empty(),
             },
+            MessageRef::BlockFooter(message) => Self::BlockFooter {
+                message,
+                include_certificates: true,
+            },
+            MessageRef::EntryUpdateParent(message) => Self::EntryUpdateParent { message },
         }
     }
 }

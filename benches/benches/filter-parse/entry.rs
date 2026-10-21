@@ -14,7 +14,10 @@ pub fn bench_parse_entries(criterion: &mut Criterion) {
         .iter()
         .map(|e| {
             let replica = e.to_replica();
-            let msg = ProtobufMessage::Entry { entry: &replica };
+            let msg = ProtobufMessage::Entry {
+                bank_id: e.bank_id,
+                entry: &replica,
+            };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)
         })
         .collect::<Vec<_>>();

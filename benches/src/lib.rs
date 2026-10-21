@@ -21,7 +21,9 @@ pub mod fixtures {
             },
         },
         solana_clock::{BankId, Slot},
-        solana_entry::block_component::{BlockFooterV1, VersionedBlockFooter},
+        solana_entry::block_component::{
+            BlockFinalizationCert, BlockFooterV1, VersionedBlockFooter, VotesAggregate,
+        },
         solana_hash::{HASH_BYTES, Hash},
         solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
         solana_pubkey::Pubkey,
@@ -77,6 +79,7 @@ pub mod fixtures {
         pub write_version: u64,
         pub transaction_signature: Option<SanitizedTransaction>,
         pub slot: Slot,
+        pub bank_id: Option<BankId>,
     }
 
     impl GeneratedAccount {
@@ -111,6 +114,7 @@ pub mod fixtures {
                 }),
                 slot: self.slot,
                 is_startup: false,
+                bank_id: self.bank_id,
             }
         }
     }
@@ -171,6 +175,7 @@ pub mod fixtures {
                                         write_version,
                                         transaction_signature: transaction_signature.cloned(),
                                         slot,
+                                        bank_id: [None, Some(0), Some(42)][accounts.len() % 3],
                                     })
                                 }
                             }
@@ -189,6 +194,7 @@ pub mod fixtures {
         block: ConfirmedBlock,
         rewards: RewardsAndNumPartitions,
         entry_count: u64,
+        pub bank_id: BankId,
     }
 
     impl GeneratedBlockMeta {
@@ -220,6 +226,7 @@ pub mod fixtures {
                 parent_blockhash: self.block.previous_blockhash.clone(),
                 executed_transaction_count: self.block.transactions.len() as u64,
                 entries_count: self.entry_count,
+                bank_id: self.bank_id,
             }
         }
     }
@@ -239,12 +246,14 @@ pub mod fixtures {
                         block: block.clone(),
                         rewards: rewards.clone(),
                         entry_count: 0,
+                        bank_id: 0,
                     },
                     GeneratedBlockMeta {
                         slot,
                         block,
                         rewards,
                         entry_count: 42,
+                        bank_id: 42,
                     },
                 ]
             })
@@ -259,6 +268,7 @@ pub mod fixtures {
         pub hash: Hash,
         pub executed_transaction_count: u64,
         pub starting_transaction_index: usize,
+        pub bank_id: BankId,
     }
 
     impl GeneratedEntry {
@@ -281,6 +291,7 @@ pub mod fixtures {
                 hash: self.hash.as_ref().to_vec(),
                 executed_transaction_count: self.executed_transaction_count,
                 starting_transaction_index: self.starting_transaction_index as u64,
+                bank_id: self.bank_id,
             }
         }
     }
@@ -307,6 +318,7 @@ pub mod fixtures {
                                     hash: *hash,
                                     executed_transaction_count,
                                     starting_transaction_index,
+                                    bank_id: [0, 42][entries.len() % 2],
                                 });
                             }
                         }
@@ -322,6 +334,7 @@ pub mod fixtures {
         pub slot: Slot,
         pub parent: Option<Slot>,
         pub status: GeyserSlotStatus,
+        pub bank_id: Option<BankId>,
     }
 
     impl GeneratedSlot {
@@ -347,6 +360,7 @@ pub mod fixtures {
                 } else {
                     None
                 },
+                bank_id: self.bank_id,
             }
         }
     }
@@ -369,6 +383,7 @@ pub mod fixtures {
                         slot,
                         parent,
                         status,
+                        bank_id: [None, Some(0), Some(42)][slots.len() % 3],
                     })
                 }
             }
@@ -385,6 +400,7 @@ pub mod fixtures {
         pub versioned_transaction: VersionedTransaction,
         pub transaction_status_meta: TransactionStatusMeta,
         pub index: usize,
+        pub bank_id: BankId,
     }
 
     impl GeneratedTransaction {
@@ -412,6 +428,7 @@ pub mod fixtures {
                     index: self.index as u64,
                 }),
                 slot: self.slot,
+                bank_id: self.bank_id,
             }
         }
     }
@@ -453,6 +470,7 @@ pub mod fixtures {
                                 .get_status_meta()
                                 .expect("failed to get transaction status meta"),
                             index,
+                            bank_id: [0, 42][index % 2],
                         }
                     })
                     .collect::<Vec<_>>();
@@ -784,7 +802,51 @@ pub mod fixtures {
                     notar_reward_cert: None,
                 }),
             },
+            GeneratedBlockFooter {
+                slot: 362_000_002,
+                bank_id: 43,
+                block_footer: VersionedBlockFooter::V1(BlockFooterV1 {
+                    bank_hash: Hash::new_from_array([8; HASH_BYTES]),
+                    block_producer_time_nanos: 1_757_500_000_400_000_000,
+                    block_user_agent: b"agave/4.3.0".to_vec(),
+                    block_final_cert: Some(BlockFinalizationCert {
+                        slot: 362_000_001,
+                        block_id: Hash::new_from_array([9; HASH_BYTES]),
+                        final_aggregate: generate_votes_aggregate(1, &[0b101, 0b1]),
+                        notar_aggregate: Some(generate_votes_aggregate(2, &[0b11])),
+                    }),
+                    // wincode: slot, signature, `ShortU16` bitmap length, bitmap
+                    skip_reward_cert: Some(
+                        wincode::deserialize(
+                            &[&361_999_999u64.to_le_bytes()[..], &[3; 96], &[1, 0b111]].concat(),
+                        )
+                        .expect("valid skip reward cert"),
+                    ),
+                    // wincode: slot, block_id, signature, `ShortU16` bitmap length, bitmap
+                    notar_reward_cert: Some(
+                        wincode::deserialize(
+                            &[
+                                &362_000_000u64.to_le_bytes()[..],
+                                &[4; 32],
+                                &[5; 96],
+                                &[2, 0b1, 0b10],
+                            ]
+                            .concat(),
+                        )
+                        .expect("valid notar reward cert"),
+                    ),
+                }),
+            },
         ]
+    }
+
+    /// `VotesAggregate` fields are private, build it from wincode layout:
+    /// compressed signature, `u16` LE bitmap length, bitmap
+    fn generate_votes_aggregate(signature: u8, bitmap: &[u8]) -> VotesAggregate {
+        let mut bytes = vec![signature; 96];
+        bytes.extend_from_slice(&(bitmap.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(bitmap);
+        wincode::deserialize(&bytes).expect("valid votes aggregate")
     }
 
     #[derive(Debug, Clone)]

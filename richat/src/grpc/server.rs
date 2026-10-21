@@ -6,7 +6,7 @@ use {
         metrics::{self, GrpcSubscribeMessage},
         version::VERSION,
     },
-    ::metrics::{Gauge, counter, gauge, histogram},
+    ::metrics::{Counter, Gauge, counter, gauge, histogram},
     crossbeam_queue::SegQueue,
     futures::{
         future::{FutureExt, TryFutureExt, ready, try_join_all},
@@ -35,7 +35,11 @@ use {
         },
         richat::SubscribeAccountsRequest,
     },
-    richat_shared::{jsonrpc::helpers::X_SUBSCRIPTION_ID, mutex_lock, transports::RecvError},
+    richat_shared::{
+        jsonrpc::helpers::X_SUBSCRIPTION_ID,
+        mutex_lock,
+        transports::{RecvError, grpc::ConfigGrpcServer},
+    },
     smallvec::SmallVec,
     solana_clock::{MAX_PROCESSING_AGE, Slot},
     solana_commitment_config::CommitmentLevel,
@@ -127,14 +131,7 @@ impl GrpcServer {
             subscribe_messages_replay_len_max: config.stream.messages_replay_len_max,
         };
 
-        let mut service = geyser_gen::geyser_server::GeyserServer::new(grpc_server.clone())
-            .max_decoding_message_size(config.server.max_decoding_message_size);
-        for encoding in config.server.compression.accept {
-            service = service.accept_compressed(encoding);
-        }
-        for encoding in config.server.compression.send {
-            service = service.send_compressed(encoding);
-        }
+        let service = grpc_server.clone().create_service(&config.server);
 
         // Spawn workers pool
         let workers = config
@@ -190,6 +187,21 @@ impl GrpcServer {
 
         // Wait spawned features
         Ok(try_join_all([block_meta_jh, block_meta_task_jh, workers, server]).map_ok(|_| ()))
+    }
+
+    pub(crate) fn create_service(
+        self,
+        config: &ConfigGrpcServer,
+    ) -> geyser_gen::geyser_server::GeyserServer<Self> {
+        let mut service = geyser_gen::geyser_server::GeyserServer::new(self)
+            .max_decoding_message_size(config.max_decoding_message_size);
+        for encoding in config.compression.accept.iter().copied() {
+            service = service.accept_compressed(encoding);
+        }
+        for encoding in config.compression.send.iter().copied() {
+            service = service.send_compressed(encoding);
+        }
+        service
     }
 
     fn get_x_subscription_id<T>(request: &Request<T>) -> String {
@@ -279,7 +291,9 @@ impl GrpcServer {
 
             if matches!(
                 message,
-                ParsedMessage::Slot(_) | ParsedMessage::BlockMeta(_)
+                ParsedMessage::Slot(_)
+                    | ParsedMessage::BlockMeta(_)
+                    | ParsedMessage::EntryUpdateParent(_)
             ) {
                 block_meta.push(message);
             }
@@ -1017,6 +1031,8 @@ impl SubscribeClientState {
 pub struct ReceiverStream {
     client: SubscribeClient,
     finished: bool,
+    /// (messages, bytes) counters per message type, a registry lookup per message is expensive
+    counters: [Option<(Counter, Counter)>; GrpcSubscribeMessage::COUNT],
 }
 
 impl ReceiverStream {
@@ -1024,6 +1040,7 @@ impl ReceiverStream {
         Self {
             client,
             finished: false,
+            counters: [const { None }; GrpcSubscribeMessage::COUNT],
         }
     }
 }
@@ -1051,18 +1068,23 @@ impl Stream for ReceiverStream {
                     self.client
                         .messages_len
                         .fetch_sub(data.len(), Ordering::Relaxed);
-                    counter!(
-                        metrics::GRPC_SUBSCRIBE_MESSAGES_COUNT_TOTAL,
-                        "x_subscription_id" => Arc::clone(&self.client.x_subscription_id),
-                        "message" => message.as_str(),
-                    )
-                    .increment(1);
-                    counter!(
-                        metrics::GRPC_SUBSCRIBE_MESSAGES_BYTES_TOTAL,
-                        "x_subscription_id" => Arc::clone(&self.client.x_subscription_id),
-                        "message" => message.as_str(),
-                    )
-                    .increment(data.len() as u64);
+                    let me = &mut *self;
+                    let (count, bytes) = me.counters[message as usize].get_or_insert_with(|| {
+                        (
+                            counter!(
+                                metrics::GRPC_SUBSCRIBE_MESSAGES_COUNT_TOTAL,
+                                "x_subscription_id" => Arc::clone(&me.client.x_subscription_id),
+                                "message" => message.as_str(),
+                            ),
+                            counter!(
+                                metrics::GRPC_SUBSCRIBE_MESSAGES_BYTES_TOTAL,
+                                "x_subscription_id" => Arc::clone(&me.client.x_subscription_id),
+                                "message" => message.as_str(),
+                            ),
+                        )
+                    });
+                    count.increment(1);
+                    bytes.increment(data.len() as u64);
 
                     Ok(data)
                 }

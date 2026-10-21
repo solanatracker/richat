@@ -14,10 +14,10 @@ use {
             CommitmentLevel, SubscribeRequest, SubscribeRequestAccountsDataSlice,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
             SubscribeRequestFilterAccountsFilterLamports,
-            SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
-            SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-            SubscribeUpdate,
+            SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlockFooter,
+            SubscribeRequestFilterBlocks, SubscribeRequestFilterBlocksMeta,
+            SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
+            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
             subscribe_request_filter_accounts_filter::Filter as AccountsFilterOneof,
             subscribe_request_filter_accounts_filter_lamports::Cmp as AccountsFilterLamports,
             subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
@@ -37,6 +37,7 @@ type TransactionsStatusFilterMap = HashMap<String, SubscribeRequestFilterTransac
 type EntryFilterMap = HashMap<String, SubscribeRequestFilterEntry>;
 type BlocksFilterMap = HashMap<String, SubscribeRequestFilterBlocks>;
 type BlocksMetaFilterMap = HashMap<String, SubscribeRequestFilterBlocksMeta>;
+type BlockFooterFilterMap = HashMap<String, SubscribeRequestFilterBlockFooter>;
 
 #[derive(Debug, Args)]
 pub struct ArgsAppStreamGrpc {
@@ -385,6 +386,10 @@ struct ActionSubscribe {
     #[clap(long)]
     entries: bool,
 
+    /// Include EntryUpdateParent updates (Alpenglow) in the entries stream
+    #[clap(long)]
+    entries_include_update_parent: Option<bool>,
+
     /// Subscribe on block updates
     #[clap(long)]
     blocks: bool,
@@ -408,6 +413,14 @@ struct ActionSubscribe {
     /// Subscribe on block meta updates (without transactions)
     #[clap(long)]
     blocks_meta: bool,
+
+    /// Subscribe on block footer updates (Alpenglow)
+    #[clap(long)]
+    block_footer: bool,
+
+    /// Include certificates to block footer message
+    #[clap(long)]
+    block_footer_include_certificates: Option<bool>,
 
     /// Re-send message from slot
     #[clap(long)]
@@ -557,7 +570,12 @@ impl ActionSubscribe {
 
         let mut entries: EntryFilterMap = HashMap::new();
         if self.entries {
-            entries.insert("client".to_owned(), SubscribeRequestFilterEntry {});
+            entries.insert(
+                "client".to_owned(),
+                SubscribeRequestFilterEntry {
+                    include_update_parent: self.entries_include_update_parent,
+                },
+            );
         }
 
         let mut blocks: BlocksFilterMap = HashMap::new();
@@ -577,6 +595,16 @@ impl ActionSubscribe {
         let mut blocks_meta: BlocksMetaFilterMap = HashMap::new();
         if self.blocks_meta {
             blocks_meta.insert("client".to_owned(), SubscribeRequestFilterBlocksMeta {});
+        }
+
+        let mut block_footer: BlockFooterFilterMap = HashMap::new();
+        if self.block_footer {
+            block_footer.insert(
+                "client".to_owned(),
+                SubscribeRequestFilterBlockFooter {
+                    include_certificates: self.block_footer_include_certificates,
+                },
+            );
         }
 
         let mut accounts_data_slice = Vec::new();
@@ -608,6 +636,7 @@ impl ActionSubscribe {
                 accounts_data_slice,
                 ping,
                 from_slot: self.from_slot,
+                block_footer,
             },
             self.stats,
             self.verify_encoding,

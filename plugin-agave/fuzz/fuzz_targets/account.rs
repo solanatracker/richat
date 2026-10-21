@@ -54,6 +54,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_message: FuzzAccountMessage| {
     });
 
     let message = ProtobufMessage::Account {
+        bank_id: Some(fuzz_message.slot),
         account: &ReplicaAccountInfoV3 {
             pubkey: &fuzz_message.account.pubkey,
             lamports: fuzz_message.account.lamports,

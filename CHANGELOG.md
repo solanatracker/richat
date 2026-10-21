@@ -12,6 +12,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Fixes
 
+- richat, plugin-agave: gRPC servers accept and send `gzip` / `zstd` by default, like Yellowstone gRPC. Before, a client asking for compressed responses received uncompressed data, and a client sending compressed requests was rejected with `Unimplemented`. Set `compression.accept` / `compression.send` to `[]` to disable; gRPC clients (sources) still default to no compression.
+
 - richat: when upstream recovery history is unavailable, reconnect live without `from_slot` instead of retrying the stale cursor; recognize Yellowstone's `OUT_OF_RANGE` response and reset backoff only after receiving source data.
 - richat: persist recovery gaps and keep explicit client replay strict: unavailable history errors instead of silently falling back to live.
 - filter: emit each matching block filter name once instead of eight times.
@@ -26,8 +28,24 @@ The minor version will be incremented upon a breaking change and the patch versi
 - richat: verify `from_slot` with the official Yellowstone protobuf client over HTTP/2, including blocks, accounts, transactions, and repeated requests; remove the blanket `blocks are not possible to replay` rejection.
 - richat: support `from_slot` at every commitment, including complete blocks; configure disk history with `storage.commitments` (default `[processed]`) and `max_slots` (unchanged default 1024, tested with 3000).
 
+- proto: upgrade `yellowstone-grpc-proto` to `14.0.1` (Alpenglow): `bank_id` on account, slot, transaction, transaction status, entry, block meta and block updates; `SubscribeUpdateBlockFooter` (tag `12`) with structured certificates and `SubscribeUpdateEntryUpdateParent` (tag `13`); `convert_to::create_block_footer_from_wincode` builds the Yellowstone footer from the wincode `VersionedBlockFooter`.
+- plugin-agave: encode `bank_id` from `update_account_for_bank`, `update_bank_status`, `notify_transaction_for_bank`, `notify_entry_for_bank`, `notify_block_metadata_for_bank` and `notify_block_footer` (raw and prost encoders).
+- filter: parse `bank_id` (`0` is reported as no bank); new `block_footer` filter (`include_certificates`) and `entry.include_update_parent`; Richat-only block footers and entry update parents are parsed and served as Yellowstone tags `12` / `13` instead of being skipped.
+- richat: fork-aware channel for Alpenglow: per-slot state is kept per candidate bank and a `Block` is built per candidate; confirmed / finalized streams get only the data of the candidate selected by the confirmed status (the bank of a status with `bank_id`, otherwise the confirmed bank, otherwise the latest candidate); data of a bank cleared by `EntryUpdateParent` is dropped, including later messages; processed keeps every candidate with its `bank_id`; disk replay stores the same streams.
+- richat: subscribe to block footers and entry update parents upstream (Richat `enable_block_footers` / `enable_entry_update_parents`, Yellowstone `block_footer.include_certificates` / `entry.include_update_parent`) and serve the `block_footer` filter downstream; gRPC `getLatestBlockhash` / `isBlockhashValid` follow the confirmed candidate and forget cleared ones.
+- richat: with several sources (`dedup_required`), bank-scoped messages of a slot are taken from the first source that sent one, because `bank_id` is local to the node; messages without bank still race.
+- cli: print `bankId`, Yellowstone block footers and entry update parents; `stream grpc` flags `--entries-include-update-parent`, `--block-footer`, `--block-footer-include-certificates`.
+- plugin-agave: encode messages before taking the ring buffer lock, drop evicted payloads and wake receivers after releasing it, and skip disabled notifications without touching the payload refcount.
+- filter: reserve the exact encoded length before encoding a `FilteredUpdate` (one allocation instead of repeated `Vec` growth).
+- richat: cache per-client gRPC subscribe message counters instead of a metrics registry lookup per message.
+- client: gRPC defaults raised for high-volume streams: `initial_connection_window_size` 64MiB, `initial_stream_window_size` 32MiB, `max_decoding_message_size` 16MiB.
+- richat: pubsub `tcp_nodelay` defaults to `true`; gRPC `messages_cached_max` defaults to `16_384`; example config uses `parser: limited` for sources.
+
 ### Breaking
 
+- plugin-agave: every `notifications` option (`deshred_transactions`, `deshred_transactions_alt_resolution`, `contact_info`, `block_footers`) is enabled by default, like Yellowstone gRPC; set them to `false` to keep the previous behaviour. Richat stream clients still receive these messages only when they enable them in `RichatFilter`.
+- plugin-agave, filter, proto: `bank_id` arguments / fields on `ProtobufMessage`, encoders and `Message*` types; `SubscribeRequest` has new `block_footer` field and `SubscribeRequestFilterEntry` has `include_update_parent`.
+- filter: `FilteredUpdate::encode` takes `&mut Vec<u8>` instead of `impl BufMut`.
 - richat: new disk chunks record commitment streams and blocks. Old processed-only chunks remain readable, but new chunks cannot be read by older binaries.
 
 ## 2026-09-10

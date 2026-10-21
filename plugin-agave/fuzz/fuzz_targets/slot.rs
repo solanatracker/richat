@@ -43,6 +43,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_slot: FuzzSlot| {
         slot: fuzz_slot.slot,
         parent: fuzz_slot.parent,
         status: &fuzz_slot.status.into(),
+        bank_id: Some(fuzz_slot.slot),
     };
     let created_at = SystemTime::now();
 

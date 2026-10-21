@@ -15,6 +15,7 @@ pub fn bench_parse_block_metas(criterion: &mut Criterion) {
         .map(|b| {
             let replica = b.to_replica();
             let msg = ProtobufMessage::BlockMeta {
+                bank_id: b.bank_id,
                 blockinfo: &replica,
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)

@@ -378,6 +378,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
         Some(UpdateOneof::Account(SubscribeUpdateAccount {
             slot,
             account: Some(account),
+            bank_id,
             ..
         })) => {
             let txn = account
@@ -397,6 +398,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
                 .context("failed to create txn")?;
             let msg = ProtobufMessage::Account {
                 slot: *slot,
+                bank_id: *bank_id,
                 account: &ReplicaAccountInfoV3 {
                     pubkey: account.pubkey.as_ref(),
                     lamports: account.lamports,
@@ -415,8 +417,10 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
             parent,
             status,
             dead_error,
+            bank_id,
         })) => {
             let msg = ProtobufMessage::Slot {
+                bank_id: *bank_id,
                 slot: *slot,
                 parent: *parent,
                 status: &match SlotStatus::try_from(*status) {
@@ -437,6 +441,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
         Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
             transaction: Some(tx),
             slot,
+            bank_id,
         })) => {
             let tx_with_meta = match convert_from::create_tx_with_meta(tx.clone())
                 .map_err(|error| anyhow::anyhow!(error))?
@@ -457,6 +462,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
 
             let msg = ProtobufMessage::Transaction {
                 slot: *slot,
+                bank_id: *bank_id,
                 transaction: &ReplicaTransactionInfoV3 {
                     signature: &signature,
                     message_hash: &message_hash,
@@ -470,6 +476,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
         }
         Some(UpdateOneof::Entry(entry)) => {
             let msg = ProtobufMessage::Entry {
+                bank_id: entry.bank_id,
                 entry: &ReplicaEntryInfoV2 {
                     slot: entry.slot,
                     index: entry.index as usize,
@@ -483,6 +490,7 @@ fn convert_prost_to_raw_geyser(msg: &SubscribeUpdate) -> anyhow::Result<Option<V
         }
         Some(UpdateOneof::BlockMeta(meta)) => {
             let msg = ProtobufMessage::BlockMeta {
+                bank_id: meta.bank_id,
                 blockinfo: &ReplicaBlockInfoV4 {
                     parent_slot: meta.parent_slot,
                     slot: meta.slot,

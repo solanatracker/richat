@@ -230,6 +230,8 @@ pub enum GrpcSubscribeMessage {
     Entry,
     BlockMeta,
     Block,
+    BlockFooter,
+    EntryUpdateParent,
     Ping,
     Pong,
 }
@@ -244,11 +246,15 @@ impl<'a> From<&FilteredUpdateType<'a>> for GrpcSubscribeMessage {
             FilteredUpdateType::Entry { .. } => Self::Entry,
             FilteredUpdateType::BlockMeta { .. } => Self::BlockMeta,
             FilteredUpdateType::Block { .. } => Self::Block,
+            FilteredUpdateType::BlockFooter { .. } => Self::BlockFooter,
+            FilteredUpdateType::EntryUpdateParent { .. } => Self::EntryUpdateParent,
         }
     }
 }
 
 impl GrpcSubscribeMessage {
+    pub const COUNT: usize = Self::Pong as usize + 1;
+
     pub const fn as_str(self) -> &'static str {
         match self {
             GrpcSubscribeMessage::Slot => "slot",
@@ -258,6 +264,8 @@ impl GrpcSubscribeMessage {
             GrpcSubscribeMessage::Entry => "entry",
             GrpcSubscribeMessage::BlockMeta => "blockmeta",
             GrpcSubscribeMessage::Block => "block",
+            GrpcSubscribeMessage::BlockFooter => "blockfooter",
+            GrpcSubscribeMessage::EntryUpdateParent => "entryupdateparent",
             GrpcSubscribeMessage::Ping => "ping",
             GrpcSubscribeMessage::Pong => "pong",
         }

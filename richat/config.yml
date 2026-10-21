@@ -10,7 +10,7 @@ channel:
   sources_sighup_reload: false # if `true`, SIGHUP reload sources from the config
   sources:
     - name: plugin-grpc
-      parser: prost # valid: prost, limited
+      parser: limited # valid: prost, limited (limited is faster: keeps raw bytes instead of re-encoding)
       disable_accounts: false
       exclude_on_finish: false
       reconnect: null
@@ -23,14 +23,14 @@ channel:
       buffer_size: null
       http2_adaptive_window: null
       http2_keep_alive_interval: null
-      initial_connection_window_size: null
-      initial_stream_window_size: null
+      initial_connection_window_size: 67108864 # 64MiB
+      initial_stream_window_size: 33554432 # 32MiB
       keep_alive_timeout: null
       keep_alive_while_idle: false
       tcp_keepalive: 15s
       tcp_nodelay: true
       timeout: null
-      max_decoding_message_size: 4MiB # better set to 16MiB (because account messages can be more than 10MiB)
+      max_decoding_message_size: 16MiB # account messages can be more than 10MiB
       compression:
         accept: [] # valid: gzip, zstd
         send: [] # valid: gzip, zstd
@@ -91,13 +91,13 @@ apps:
   #     # tls_config:
   #     #   cert: /path/to/cert.cert
   #     #   key: /path/to/key.key
-  #     compression: # default is no compression
+  #     compression: # used only when the client asks for it, set `[]` to disable
   #       accept:
-  #         # - gzip
-  #         # - zstd
+  #         - gzip
+  #         - zstd
   #       send:
-  #         # - gzip
-  #         # - zstd
+  #         - gzip
+  #         - zstd
   #     max_decoding_message_size: 4MiB
   #     server_tcp_keepalive: 15s
   #     server_tcp_nodelay: true
@@ -126,13 +126,13 @@ apps:
   #     # tls_config:
   #     #   cert: /path/to/cert.cert
   #     #   key: /path/to/key.key
-  #     compression:
+  #     compression: # used only when the client asks for it, set `[]` to disable
   #       accept:
-  #       # - gzip
-  #       # - zstd
+  #         - gzip
+  #         - zstd
   #       send:
-  #       # - gzip
-  #       # - zstd
+  #         - gzip
+  #         - zstd
   #     max_decoding_message_size: 4MiB
   #     server_tcp_keepalive: 20s
   #     server_tcp_nodelay: true
@@ -144,7 +144,7 @@ apps:
   #   workers:
   #     threads: 2
   #     affinity: null # by default no affinity (taskset syntax)
-  #     messages_cached_max: 1_024
+  #     messages_cached_max: 16_384
   #     ticks_without_messages_max: None
   #   stream:
   #     messages_len_max: 16MiB
@@ -202,7 +202,7 @@ apps:
   # disabled by default
   # pubsub:
   #   endpoint: 0.0.0.0:8000
-  #   tcp_nodelay: null
+  #   tcp_nodelay: true
   #   # tls_config:
   #   #   # cert: /path/to/cert.cert
   #   #   # key: /path/to/key.key

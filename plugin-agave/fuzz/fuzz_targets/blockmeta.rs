@@ -83,6 +83,7 @@ libfuzzer_sys::fuzz_target!(|fuzz_blockmeta: FuzzBlockMeta| {
     };
 
     let message = ProtobufMessage::BlockMeta {
+        bank_id: blockinfo.slot,
         blockinfo: &blockinfo,
     };
     let created_at = SystemTime::now();

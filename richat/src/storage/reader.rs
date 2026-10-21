@@ -509,6 +509,7 @@ mod tests {
                 parent: Some(9),
                 status: 0,
                 dead_error: None,
+                bank_id: None,
             })),
         }
         .encode_to_vec();

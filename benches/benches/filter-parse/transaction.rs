@@ -16,6 +16,7 @@ pub fn bench_parse_transactions(criterion: &mut Criterion) {
             let (slot, replica) = tx.to_replica();
             let msg = ProtobufMessage::Transaction {
                 slot,
+                bank_id: tx.bank_id,
                 transaction: &replica,
             };
             msg.encode_with_timestamp(ProtobufEncoder::Raw, created_at)

@@ -48,7 +48,7 @@ impl Default for ConfigAppsPubsub {
     fn default() -> Self {
         Self {
             endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
-            tcp_nodelay: None,
+            tcp_nodelay: Some(true), // notifications are small writes, Nagle delays them
             tls_config: None,
             recv_max_message_size: 4 * 1024, // 4KiB
             enable_block_subscription: false,

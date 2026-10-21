@@ -17,6 +17,7 @@ pub struct FuzzEntry {
 
 libfuzzer_sys::fuzz_target!(|fuzz_entry: FuzzEntry| {
     let message = ProtobufMessage::Entry {
+        bank_id: fuzz_entry.slot,
         entry: &ReplicaEntryInfoV2 {
             slot: fuzz_entry.slot,
             index: fuzz_entry.index,

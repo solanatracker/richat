@@ -24,7 +24,10 @@ pub fn bench_encode_block_metas(criterion: &mut Criterion) {
                     #[allow(clippy::unit_arg)]
                     black_box({
                         for blockinfo in block_metas {
-                            let message = ProtobufMessage::BlockMeta { blockinfo };
+                            let message = ProtobufMessage::BlockMeta {
+                                bank_id: 42,
+                                blockinfo,
+                            };
                             message.encode_with_timestamp(ProtobufEncoder::Prost, created_at);
                         }
                     })
@@ -40,7 +43,10 @@ pub fn bench_encode_block_metas(criterion: &mut Criterion) {
                     #[allow(clippy::unit_arg)]
                     black_box({
                         for blockinfo in block_metas {
-                            let message = ProtobufMessage::BlockMeta { blockinfo };
+                            let message = ProtobufMessage::BlockMeta {
+                                bank_id: 42,
+                                blockinfo,
+                            };
                             message.encode_with_timestamp(ProtobufEncoder::Raw, created_at);
                         }
                     })

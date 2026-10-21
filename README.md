@@ -171,6 +171,33 @@ flowchart LR
 At one moment of time we can support more than one agave version (like v2.0 and v2.1), as result we can have two different major supported versions of every component, for example: `cli-v1.y.z` for `agave-v2.0` and `cli-v2.y.z` for `agave-v2.1`. In addition to standard version, `plugin-agave` can have one or more tags with pinned solana version.
 
 
+## Alpenglow
+
+Richat speaks Yellowstone `14.x` (`yellowstone-grpc-proto` `14.0.1`):
+
+- `bank_id` is set on accounts, slots, transactions, transaction statuses, entries,
+  block metas, blocks and footers. It is local to the validator that produced the
+  update and is `0` / unset for updates without a bank (startup accounts, slot
+  statuses from `update_slot_status`).
+- Block footers (`SubscribeUpdateBlockFooter`, tag `12`) are served for the
+  `block_footer` filter; certificates are sent only with `include_certificates: true`.
+  The plugin emits footers by default, like Yellowstone gRPC; set
+  `notifications.block_footers: false` to disable them (the other `notifications`
+  options, deshred transactions and contact info, are enabled by default too).
+- `SubscribeUpdateEntryUpdateParent` (tag `13`) is served to `entry` filters with
+  `include_update_parent: true`. It invalidates every update of `cleared_bank_id`.
+
+A slot can have more than one candidate bank. Processed streams every candidate
+with its `bank_id`. Confirmed and finalized stream only the candidate selected by
+the confirmed status: its `bank_id`, otherwise the latest candidate (a finalized
+status without `bank_id` follows the confirmed candidate).
+Updates of a cleared bank are dropped, including updates that arrive later, and
+`EntryUpdateParent` itself is processed-only. A `Block` is built per candidate.
+
+With several upstream sources, bank-scoped updates of a slot are taken from the
+first source that sent one, because bank ids of different validators can not be
+merged. Updates without a bank (for example slot statuses) still race.
+
 ## gRPC replay (`from_slot`)
 
 Richat serves downstream gRPC subscriptions locally. It consumes an upstream
