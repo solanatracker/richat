@@ -188,7 +188,7 @@ impl Storage {
                     .map(|msg| ((&msg.filtered_update).into(), msg.encode_to_vec()))
                     .collect::<SmallVec<[(GrpcSubscribeMessage, Vec<u8>); 2]>>();
                 for (message, data) in items {
-                    req.client.push_message(message, data);
+                    req.client.push_message(message, data.into());
                     pushed = true;
                 }
             }

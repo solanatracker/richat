@@ -449,7 +449,7 @@ impl FilterAccounts {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FilterAccountDataSlices(SmallVec<[Range<usize>; 4]>);
 
 impl FilterAccountDataSlices {

@@ -148,6 +148,7 @@ apps:
   #     threads: 2
   #     affinity: null # by default no affinity (taskset syntax)
   #     messages_cached_max: 16_384
+  #     encoded_cached_max: 64MiB # encoded updates shared between clients, per worker and commitment
   #     ticks_without_messages_max: None
   #   stream:
   #     messages_len_max: 16MiB

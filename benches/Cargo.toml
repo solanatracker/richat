@@ -18,6 +18,10 @@ name = "encode-geyser"
 harness = false
 
 [[bench]]
+name = "encode-shared"
+harness = false
+
+[[bench]]
 name = "filter-parse"
 harness = false
 
@@ -38,9 +42,11 @@ wincode = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+prost-types = { workspace = true }
 richat-filter = { workspace = true }
 richat-plugin-agave = { workspace = true }
 richat-proto = { workspace = true }
+solana-commitment-config = { workspace = true }
 
 [lints]
 workspace = true

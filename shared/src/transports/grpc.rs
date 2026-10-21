@@ -393,7 +393,7 @@ impl<F2: Fn() + Unpin> Stream for ReceiverStream<F2> {
     }
 }
 
-trait SubscribeMessage {
+pub trait SubscribeMessage {
     fn encode(self, buf: &mut EncodeBuf<'_>);
 }
 

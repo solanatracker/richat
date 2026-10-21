@@ -13,14 +13,15 @@ use {
         stream::Stream,
         task::AtomicWaker,
     },
-    prost::Message,
+    prost::{Message, bytes::Bytes},
     quanta::Instant,
     richat_filter::{
         config::{
             ConfigFilter, ConfigFilterAccounts, ConfigFilterSlots,
             ConfigLimits as ConfigFilterLimits,
         },
-        filter::Filter,
+        encode_cache::{EncodeCache, SharedEncodedUpdate, encode_body},
+        filter::{Filter, FilteredUpdate},
         message::MessageRef,
     },
     richat_metrics::{duration_to_seconds, subscription_id_label},
@@ -38,9 +39,11 @@ use {
     richat_shared::{
         jsonrpc::helpers::X_SUBSCRIPTION_ID,
         mutex_lock,
-        transports::{RecvError, grpc::ConfigGrpcServer},
+        transports::{
+            RecvError,
+            grpc::{ConfigGrpcServer, SubscribeMessage as SubscribeMessageEncode},
+        },
     },
-    smallvec::SmallVec,
     solana_clock::{MAX_PROCESSING_AGE, Slot},
     solana_commitment_config::CommitmentLevel,
     solana_pubkey::Pubkey,
@@ -145,6 +148,7 @@ impl GrpcServer {
                         grpc_server.worker_messages(
                             index,
                             config.workers.messages_cached_max,
+                            config.workers.encoded_cached_max,
                             config
                                 .workers
                                 .ticks_without_messages_max
@@ -307,14 +311,18 @@ impl GrpcServer {
         &self,
         index: usize,
         messages_cached_max: usize,
+        encoded_cached_max: usize,
         ticks_without_messages_max: usize,
         messages_max_per_tick: usize,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
         let messages_cached_max = messages_cached_max.next_power_of_two();
-        let mut messages_cache_processed = MessagesCache::new(messages_cached_max);
-        let mut messages_cache_confirmed = MessagesCache::new(messages_cached_max);
-        let mut messages_cache_finalized = MessagesCache::new(messages_cached_max);
+        let mut messages_cache_processed =
+            MessagesCache::new(messages_cached_max, encoded_cached_max);
+        let mut messages_cache_confirmed =
+            MessagesCache::new(messages_cached_max, encoded_cached_max);
+        let mut messages_cache_finalized =
+            MessagesCache::new(messages_cached_max, encoded_cached_max);
 
         let receiver = self.messages.to_receiver();
         let mut ticks_without_messages = 0;
@@ -373,25 +381,26 @@ impl GrpcServer {
             while messages_len <= client.messages_len_max
                 && messages_counter < messages_max_per_tick
             {
-                let message = match messages_cache.try_recv(&receiver, state.commitment, head) {
-                    Ok(Some(message)) => {
-                        messages_counter += 1;
-                        head += 1;
-                        state.head = IndexLocation::Memory(head);
-                        message
-                    }
-                    Ok(None) => break,
-                    Err(RecvError::Lagged) => {
-                        client.push_error(Status::data_loss("lagged"));
-                        errored = true;
-                        break;
-                    }
-                    Err(RecvError::Closed) => {
-                        client.push_error(Status::data_loss("closed"));
-                        errored = true;
-                        break;
-                    }
-                };
+                let (message, mut encoder) =
+                    match messages_cache.try_recv(&receiver, state.commitment, head) {
+                        Ok(Some(item)) => {
+                            messages_counter += 1;
+                            head += 1;
+                            state.head = IndexLocation::Memory(head);
+                            item
+                        }
+                        Ok(None) => break,
+                        Err(RecvError::Lagged) => {
+                            client.push_error(Status::data_loss("lagged"));
+                            errored = true;
+                            break;
+                        }
+                        Err(RecvError::Closed) => {
+                            client.push_error(Status::data_loss("closed"));
+                            errored = true;
+                            break;
+                        }
+                    };
 
                 if state
                     .replay_from_slot
@@ -401,15 +410,13 @@ impl GrpcServer {
                 }
                 let message_ref: MessageRef = message.as_ref().into();
                 if let Some(filter) = state.filter.as_ref() {
-                    let items = filter
-                        .get_updates_ref(message_ref, state.commitment)
-                        .iter()
-                        .map(|msg| ((&msg.filtered_update).into(), msg.encode_to_vec()))
-                        .collect::<SmallVec<[(GrpcSubscribeMessage, Vec<u8>); 2]>>();
-
-                    for (message, data) in items {
+                    for update in filter.get_updates_ref(message_ref, state.commitment) {
+                        let data = match encoder.as_mut() {
+                            Some(encoder) => encoder.encode(&update),
+                            None => update.encode_to_vec().into(),
+                        };
                         messages_len += data.len();
-                        client.push_message(message, data);
+                        client.push_message((&update.filtered_update).into(), data);
                         pushed = true;
                     }
                 }
@@ -521,7 +528,7 @@ impl GrpcServer {
                             if ts.duration_since(ts_latest) > ping_interval {
                                 ts_latest = ts;
                                 let data = SubscribeClientState::create_ping();
-                                client.push_message(GrpcSubscribeMessage::Ping, data);
+                                client.push_message(GrpcSubscribeMessage::Ping, data.into());
                                 client.wake();
                             }
                         }
@@ -549,7 +556,7 @@ impl GrpcServer {
                         Ok(Some(message)) => {
                             if let Some(id) = get_ping(&message) {
                                 let data = SubscribeClientState::create_pong(id);
-                                client.push_message(GrpcSubscribeMessage::Pong, data);
+                                client.push_message(GrpcSubscribeMessage::Pong, data.into());
                                 client.wake();
                                 continue;
                             }
@@ -880,7 +887,17 @@ impl geyser_gen::geyser_server::Geyser for GrpcServer {
     }
 }
 
-type SubscribeMessage = Result<(GrpcSubscribeMessage, Vec<u8>), Status>;
+type SubscribeMessage = Result<(GrpcSubscribeMessage, SharedEncodedUpdate), Status>;
+
+/// Encoded `SubscribeUpdate` written to the gRPC stream
+#[derive(Debug)]
+pub struct SubscribeData(SharedEncodedUpdate);
+
+impl SubscribeMessageEncode for SubscribeData {
+    fn encode(self, buf: &mut tonic::codec::EncodeBuf<'_>) {
+        self.0.encode(buf);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SubscribeClient {
@@ -917,7 +934,7 @@ impl SubscribeClient {
         self.messages.pop().map(|item| {
             item.map(|(_, data)| {
                 self.messages_len.fetch_sub(data.len(), Ordering::Relaxed);
-                data
+                data.to_vec()
             })
         })
     }
@@ -927,7 +944,7 @@ impl SubscribeClient {
         mutex_lock(&self.state)
     }
 
-    pub fn push_message(&self, message: GrpcSubscribeMessage, data: Vec<u8>) {
+    pub fn push_message(&self, message: GrpcSubscribeMessage, data: SharedEncodedUpdate) {
         self.messages_len.fetch_add(data.len(), Ordering::Relaxed);
         self.messages.push(Ok((message, data)));
     }
@@ -1069,7 +1086,7 @@ impl Drop for ReceiverStream {
 }
 
 impl Stream for ReceiverStream {
-    type Item = TonicResult<Vec<u8>>;
+    type Item = TonicResult<SubscribeData>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.finished {
@@ -1102,7 +1119,7 @@ impl Stream for ReceiverStream {
                     count.increment(1);
                     bytes.increment(data.len() as u64);
 
-                    Ok(data)
+                    Ok(SubscribeData(data))
                 }
                 Err(error) => Err(error),
             };
@@ -1119,6 +1136,7 @@ struct MessagesCache {
     head: u64,
     mask: u64,
     buffer: Box<[MessagesCacheItem]>,
+    encoded: EncodedCache,
 }
 
 impl fmt::Debug for MessagesCache {
@@ -1126,12 +1144,13 @@ impl fmt::Debug for MessagesCache {
         f.debug_struct("MessagesCache")
             .field("head", &self.head)
             .field("mask", &self.mask)
+            .field("encoded_bytes", &self.encoded.bytes)
             .finish()
     }
 }
 
 impl MessagesCache {
-    fn new(max_messages: usize) -> Self {
+    fn new(max_messages: usize, encoded_bytes_max: usize) -> Self {
         let buffer = (0..max_messages)
             .map(|_| MessagesCacheItem {
                 pos: u64::MAX,
@@ -1143,6 +1162,13 @@ impl MessagesCache {
             head: 0,
             mask: (max_messages - 1) as u64,
             buffer: buffer.into_boxed_slice(),
+            encoded: EncodedCache {
+                mask: (max_messages - 1) as u64,
+                buffer: (0..max_messages).map(|_| EncodeCache::default()).collect(),
+                tail: 0,
+                bytes: 0,
+                bytes_max: encoded_bytes_max,
+            },
         }
     }
 
@@ -1151,12 +1177,14 @@ impl MessagesCache {
         (pos & self.mask) as usize
     }
 
+    /// Returns the message and, if it is cached, an encoder that shares
+    /// encoded updates with other clients reading the same message
     fn try_recv(
         &mut self,
         receiver: &ReceiverSync,
         commitment: CommitmentLevel,
         head: u64,
-    ) -> Result<Option<Cow<'_, ParsedMessage>>, RecvError> {
+    ) -> Result<Option<MessagesCacheRecv<'_>>, RecvError> {
         if head > self.head {
             self.head = head;
         }
@@ -1164,29 +1192,102 @@ impl MessagesCache {
 
         // return if item cached
         let idx = self.get_idx(head);
-        if inrange && self.buffer[idx].pos == head {
-            return Ok(self.buffer[idx].msg.as_ref().map(Cow::Borrowed));
-        }
+        if !(inrange && self.buffer[idx].pos == head) {
+            // try to get from the channel
+            let Some(item) = receiver.try_recv(commitment, head)? else {
+                return Ok(None);
+            };
 
-        // try to get from the channel
-        let Some(item) = receiver.try_recv(commitment, head)? else {
-            return Ok(None);
-        };
+            if !inrange {
+                return Ok(Some((Cow::Owned(item), None)));
+            }
 
-        // save item if in range
-        if inrange {
+            // save item, drop encoded updates of the previous one
+            self.encoded.clear(idx);
             self.buffer[idx] = MessagesCacheItem {
                 pos: head,
-                msg: Some(item.clone()),
+                msg: Some(item),
             };
         }
-        Ok(Some(Cow::Owned(item)))
+
+        let Self {
+            buffer, encoded, ..
+        } = self;
+        Ok(buffer[idx].msg.as_ref().map(|msg| {
+            (
+                Cow::Borrowed(msg),
+                Some(SharedEncoder {
+                    cache: encoded,
+                    pos: head,
+                }),
+            )
+        }))
     }
 }
+
+type MessagesCacheRecv<'a> = (Cow<'a, ParsedMessage>, Option<SharedEncoder<'a>>);
 
 struct MessagesCacheItem {
     pos: u64,
     msg: Option<ParsedMessage>,
+}
+
+/// Encoded updates per cached message; bodies of the oldest messages are
+/// dropped first once `bytes_max` is reached
+struct EncodedCache {
+    mask: u64,
+    buffer: Box<[EncodeCache]>,
+    /// No bodies are cached for positions below `tail`
+    tail: u64,
+    bytes: usize,
+    bytes_max: usize,
+}
+
+impl EncodedCache {
+    fn clear(&mut self, idx: usize) {
+        self.bytes -= self.buffer[idx].encoded_bytes();
+        self.buffer[idx].clear();
+    }
+
+    /// Drop bodies of messages before `pos` until `bytes_max` is respected
+    fn evict(&mut self, pos: u64) -> bool {
+        self.tail = self.tail.max(pos.saturating_sub(self.mask));
+        while self.bytes >= self.bytes_max && self.tail < pos {
+            self.clear((self.tail & self.mask) as usize);
+            self.tail += 1;
+        }
+        self.bytes < self.bytes_max
+    }
+}
+
+/// Encodes an update once per message and filter output shape
+struct SharedEncoder<'a> {
+    cache: &'a mut EncodedCache,
+    pos: u64,
+}
+
+impl SharedEncoder<'_> {
+    fn encode(&mut self, update: &FilteredUpdate<'_>) -> SharedEncodedUpdate {
+        if self.pos < self.cache.tail {
+            return update.encode_to_vec().into();
+        }
+
+        let idx = (self.pos & self.cache.mask) as usize;
+        let cache = &mut self.cache.buffer[idx];
+        if let Some(body) = cache.get(update) {
+            return SharedEncodedUpdate::new(&update.filters, body.clone());
+        }
+        // first client of this shape encodes as usual
+        if !cache.mark_seen(update) || !self.cache.evict(self.pos) {
+            return update.encode_to_vec().into();
+        }
+
+        let body = Bytes::from(encode_body(update));
+        if self.cache.buffer[idx].insert(update, body.clone()) {
+            self.cache.bytes += body.len();
+        }
+        SharedEncodedUpdate::new(&update.filters, body)
+    }
 }
 
 #[cfg(test)]
@@ -1207,7 +1308,9 @@ impl GrpcServer {
             subscribe_messages_replay_len_max: 4096,
         };
         let worker = service.clone();
-        let thread = std::thread::spawn(move || worker.worker_messages(0, 128, 100, 100, shutdown));
+        let thread = std::thread::spawn(move || {
+            worker.worker_messages(0, 128, 64 * 1024 * 1024, 100, 100, shutdown)
+        });
         (service, thread)
     }
 }
@@ -1215,9 +1318,21 @@ impl GrpcServer {
 #[cfg(test)]
 mod tests {
     use {
-        super::{ReceiverStream, SubscribeClient},
+        super::{EncodeCache, EncodedCache, ReceiverStream, SharedEncoder, SubscribeClient},
         futures::FutureExt,
-        std::{sync::Arc, time::Duration},
+        maplit::hashmap,
+        prost::Message as _,
+        richat_filter::{
+            config::{ConfigFilter, ConfigFilterSlots},
+            encode_cache::encode_body,
+            filter::Filter,
+            message::{Message, MessageParserEncoding},
+        },
+        richat_proto::geyser::{
+            SubscribeUpdate, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        },
+        solana_commitment_config::CommitmentLevel,
+        std::{borrow::Cow, sync::Arc, time::Duration},
     };
 
     #[tokio::test]
@@ -1234,5 +1349,62 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), finished)
             .await
             .expect("request reader is not released");
+    }
+
+    #[test]
+    fn test_encoded_cache_evicts_oldest() {
+        let data = SubscribeUpdate {
+            filters: vec![],
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot: 42,
+                ..Default::default()
+            })),
+            created_at: Some(Default::default()),
+        }
+        .encode_to_vec();
+        let message =
+            Message::parse(Cow::Owned(data), MessageParserEncoding::Limited).expect("valid");
+        let filter = Filter::new(&ConfigFilter {
+            slots: hashmap! { "client".to_owned() => ConfigFilterSlots::default() },
+            ..Default::default()
+        });
+        let updates = filter.get_updates_ref((&message).into(), CommitmentLevel::Processed);
+        let update = &updates[0];
+        let expected = update.encode_to_vec();
+        let body_len = encode_body(update).len();
+
+        let mut cache = EncodedCache {
+            mask: 7,
+            buffer: (0..8).map(|_| EncodeCache::default()).collect(),
+            tail: 0,
+            bytes: 0,
+            bytes_max: body_len * 2,
+        };
+        {
+            let mut encode = |pos| {
+                let encoded = SharedEncoder {
+                    cache: &mut cache,
+                    pos,
+                }
+                .encode(update);
+                assert_eq!(encoded.to_vec(), expected);
+            };
+
+            // second client caches the body, two bodies fit
+            for pos in [0, 0, 1, 1, 1] {
+                encode(pos);
+            }
+            // third body drops the oldest
+            encode(2);
+            encode(2);
+            // evicted position is not cached again
+            encode(0);
+            encode(0);
+        }
+        assert_eq!(cache.tail, 1);
+        assert_eq!(cache.bytes, body_len * 2);
+        assert_eq!(cache.buffer[0].encoded_bytes(), 0);
+        assert_eq!(cache.buffer[1].encoded_bytes(), body_len);
+        assert_eq!(cache.buffer[2].encoded_bytes(), body_len);
     }
 }

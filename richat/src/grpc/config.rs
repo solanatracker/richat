@@ -31,6 +31,9 @@ pub struct ConfigAppsGrpcWorkers {
     pub threads: ConfigAppsWorkers,
     #[serde(deserialize_with = "deserialize_num_str")]
     pub messages_cached_max: usize,
+    /// Max size of encoded updates shared between clients, per worker and commitment
+    #[serde(deserialize_with = "deserialize_humansize_usize")]
+    pub encoded_cached_max: usize,
     #[serde(default, deserialize_with = "deserialize_maybe_num_str")]
     pub ticks_without_messages_max: Option<usize>,
 }
@@ -40,6 +43,7 @@ impl Default for ConfigAppsGrpcWorkers {
         Self {
             threads: ConfigAppsWorkers::default(),
             messages_cached_max: 16_384,
+            encoded_cached_max: 64 * 1024 * 1024,
             ticks_without_messages_max: None,
         }
     }

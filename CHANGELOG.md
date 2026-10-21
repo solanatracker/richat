@@ -33,6 +33,8 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ### Features
 
+- richat: encode each gRPC subscribe update once per message and filter output shape and share the bytes between clients; per client only the `filters` field is encoded. `grpc.workers.encoded_cached_max` (default `64MiB` per worker and commitment) bounds the shared encodings.
+- filter: add `encode_cache` with `EncodeCache` and `SharedEncodedUpdate` to share an encoded update body between subscribers.
 - richat: store shared replay payloads once with commitment publication references; skip excluded commitments before protobuf decoding and defer backpressured clients without stalling ready replays.
 - richat: verify `from_slot` with the official Yellowstone protobuf client over HTTP/2, including blocks, accounts, transactions, and repeated requests; remove the blanket `blocks are not possible to replay` rejection.
 - richat: support `from_slot` at every commitment, including complete blocks; configure disk history with `storage.commitments` (default `[processed]`) and `max_slots` (unchanged default 1024, tested with 3000).
